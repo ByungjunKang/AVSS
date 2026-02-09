@@ -69,61 +69,27 @@ def run_tiger_separation(audio_path: str, model_path: str, out_dir: str, device:
     return sep_paths
 
 
-def run_tiger_separation(audio_path: str, model_path: str, out_dir: str, device: str = "cuda", max_sources: int = 2):
-    """
-    Run TIGER speech separation on `audio_path` and save sep wavs into `out_dir`.
-    Returns: list of wav paths [sep0.wav, sep1.wav, ...]
-    """
-    if not model_path:
-        raise ValueError("--tiger_model_path is required when --run_tiger is set")
+# Scores extracted and saved ... (이 지점은 이미 존재) :contentReference[oaicite:11]{index=11}
 
-    os.makedirs(out_dir, exist_ok=True)
+if args.evalCol == True:
+    evaluate_col_ASD(vidTracks, scores, args)
+    quit()
+else:
+    # --- NEW: TIGER separation inside Columbia_test.py ---
+    if args.run_tiger:
+        tiger_out = args.tiger_outdir.strip()
+        if not tiger_out:
+            tiger_out = os.path.join(args.savePath, "separated_audio")
 
-    # device
-    if device == "cuda" and torch.cuda.is_available():
-        dev = torch.device("cuda")
+        sep_wavs = run_tiger_separation(
+            audio_path=args.audioFilePath,          # extracted /pyavi/audio.wav :contentReference[oaicite:12]{index=12}
+            model_path=args.tiger_model_path,
+            out_dir=tiger_out,
+            device=args.tiger_device,
+            max_sources=args.tiger_num_sources
+        )
+        # speaker별 mp4 저장(오디오는 sep wav mux)
+        export_per_speaker_videos(args, vidTracks, scores, sep_wavs, thr=args.as_thr, fps=25)
     else:
-        dev = torch.device("cpu")
+        visualization(vidTracks, scores, args)
 
-    # Load model (local folder path)
-    # TIGER inference script uses look2hear.models.TIGER.from_pretrained(...) :contentReference[oaicite:4]{index=4}
-    import look2hear.models
-    model = look2hear.models.TIGER.from_pretrained(model_path)  # local path
-    model.to(dev)
-    model.eval()
-
-    # Load audio
-    waveform, sr = torchaudio.load(audio_path)  # [C, T]
-    target_sr = 16000  # TIGER script targets 16kHz :contentReference[oaicite:5]{index=5}
-    if sr != target_sr:
-        resampler = T.Resample(orig_freq=sr, new_freq=target_sr)
-        waveform = resampler(waveform)
-        sr = target_sr
-
-    # Mono
-    if waveform.size(0) > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)  # [1, T]
-
-    # Prepare input: TIGER script builds [B, C, T] :contentReference[oaicite:6]{index=6}
-    audio_input = waveform.unsqueeze(0).to(dev)  # [1, 1, T]
-
-    with torch.no_grad():
-        est = model(audio_input)
-
-    # Robust shape handling (expected: [B, N, T] per script :contentReference[oaicite:7]{index=7})
-    if est.dim() == 3:
-        est = est.squeeze(0)  # [N, T] or [C, T]? assume [N, T]
-    else:
-        raise RuntimeError(f"Unexpected TIGER output shape: {tuple(est.shape)}")
-
-    num_src = est.shape[0]
-    use_n = min(num_src, max_sources)
-
-    sep_paths = []
-    for i in range(use_n):
-        out_wav = os.path.join(out_dir, f"sep{i}.wav")
-        track = est[i].detach().cpu().float().unsqueeze(0)  # torchaudio.save expects [C, T]
-        torchaudio.save(out_wav, track, sr)
-        sep_paths.append(out_wav)
-
-    return sep_paths
