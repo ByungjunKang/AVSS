@@ -1,0 +1,367 @@
+import glob
+import numpy as np
+import cv2
+
+def _bbox_iou(a, b):
+    ax1, ay1, ax2, ay2 = [float(x) for x in a]
+    bx1, by1, bx2, by2 = [float(x) for x in b]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    return inter / (area_a + area_b - inter + 1e-9)
+
+def _bbox_center(b):
+    x1,y1,x2,y2 = [float(x) for x in b]
+    return (0.5*(x1+x2), 0.5*(y1+y2))
+
+def _bbox_area(b):
+    x1,y1,x2,y2 = [float(x) for x in b]
+    return max(0.0, x2-x1) * max(0.0, y2-y1)
+
+def _cosine(a, b):
+    a = a.astype(np.float32); b = b.astype(np.float32)
+    na = np.linalg.norm(a); nb = np.linalg.norm(b)
+    if na < 1e-9 or nb < 1e-9:
+        return 0.0
+    return float(np.dot(a, b) / (na*nb))
+
+def _face_hist_from_frame(frame_bgr, bbox, bins=16):
+    h, w = frame_bgr.shape[:2]
+    x1,y1,x2,y2 = [int(round(x)) for x in bbox]
+    x1 = max(0,x1); y1=max(0,y1); x2=min(w,x2); y2=min(h,y2)
+    if x2-x1 < 10 or y2-y1 < 10:
+        return None
+    crop = frame_bgr[y1:y2, x1:x2]
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv],[0,1],[None],[bins,bins],[0,180,0,256])
+    hist = cv2.normalize(hist, None).flatten()
+    return hist
+
+def merge_tracklets(
+    args,
+    vidTracks,
+    scores,
+    max_gap_frames=12,          # 0.5초 @25fps
+    iou_thr=0.08,               # 카메라 움직임 고려해서 낮게
+    center_thr=80.0,            # 픽셀 거리 (데모 기준) / 필요시 조절
+    size_ratio_thr=1.8,
+    hist_thr=0.55,              # 색 히스토그램 유사도
+    use_hist=True
+):
+    """
+    Merge fragmented tracks likely belonging to the same person.
+    Uses end->start association with mutual best matching for stability.
+    """
+    if len(vidTracks) <= 1:
+        return vidTracks, scores
+
+    frame_files = sorted(glob.glob(os.path.join(args.pyframesPath, "*.jpg")))
+    def read_frame(idx):
+        if idx < 0 or idx >= len(frame_files):
+            return None
+        return cv2.imread(frame_files[idx])
+
+    # Prepare track meta
+    meta = []
+    for tid, tr in enumerate(vidTracks):
+        fr = np.asarray(tr["track"]["frame"], dtype=int)
+        bb = np.asarray(tr["track"]["bbox"], dtype=np.float32)
+        sc = np.asarray(scores[tid], dtype=np.float32)
+
+        L = min(len(fr), len(bb), len(sc))
+        fr, bb, sc = fr[:L], bb[:L], sc[:L]
+        if L == 0:
+            continue
+
+        start_f, end_f = int(fr[0]), int(fr[-1])
+        first_bb, last_bb = bb[0], bb[-1]
+        area_mean = float(np.mean([_bbox_area(x) for x in bb]))
+        meta.append({
+            "tid": tid, "start": start_f, "end": end_f,
+            "first_bb": first_bb, "last_bb": last_bb,
+            "frames": fr, "bboxes": bb, "scores": sc,
+            "area_mean": area_mean,
+        })
+
+    meta.sort(key=lambda x: x["start"])
+    n = len(meta)
+
+    # Cache appearance histograms at boundaries (optional)
+    if use_hist:
+        for m in meta:
+            f0 = read_frame(m["start"])
+            f1 = read_frame(m["end"])
+            m["hist_first"] = _face_hist_from_frame(f0, m["first_bb"]) if f0 is not None else None
+            m["hist_last"]  = _face_hist_from_frame(f1, m["last_bb"])  if f1 is not None else None
+    else:
+        for m in meta:
+            m["hist_first"] = None
+            m["hist_last"]  = None
+
+    # Build best-next / best-prev with a merge score
+    best_next = [-1]*n
+    best_next_score = [-1e9]*n
+    best_prev = [-1]*n
+    best_prev_score = [-1e9]*n
+
+    for i in range(n):
+        for j in range(i+1, n):
+            gap = meta[j]["start"] - meta[i]["end"]
+            if gap < 1:
+                continue
+            if gap > max_gap_frames:
+                break
+
+            bi = meta[i]["last_bb"]
+            bj = meta[j]["first_bb"]
+
+            iou = _bbox_iou(bi, bj)
+            ci = _bbox_center(bi); cj = _bbox_center(bj)
+            cdist = float(np.hypot(ci[0]-cj[0], ci[1]-cj[1]))
+
+            ai = _bbox_area(bi) + 1e-6
+            aj = _bbox_area(bj) + 1e-6
+            sratio = max(ai, aj) / min(ai, aj)
+
+            if sratio > size_ratio_thr:
+                continue
+
+            # allow either iou good OR center close
+            if not (iou >= iou_thr or cdist <= center_thr):
+                continue
+
+            # optional appearance check
+            if use_hist and meta[i]["hist_last"] is not None and meta[j]["hist_first"] is not None:
+                sim_hist = _cosine(meta[i]["hist_last"], meta[j]["hist_first"])
+                if sim_hist < hist_thr:
+                    continue
+            else:
+                sim_hist = 1.0
+
+            # merge score (higher better)
+            score = (2.5 * iou) + (1.2 * sim_hist) - (0.03 * cdist) - (0.10 * gap)
+
+            if score > best_next_score[i]:
+                best_next_score[i] = score
+                best_next[i] = j
+            if score > best_prev_score[j]:
+                best_prev_score[j] = score
+                best_prev[j] = i
+
+    # Mutual-best merges
+    parent = list(range(n))
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(a,b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(n):
+        j = best_next[i]
+        if j >= 0 and best_prev[j] == i:
+            union(i, j)
+
+    # Group by component and merge sequences in time order
+    groups = {}
+    for i in range(n):
+        r = find(i)
+        groups.setdefault(r, []).append(i)
+
+    merged_vidTracks = []
+    merged_scores = []
+
+    for _, idxs in groups.items():
+        idxs = sorted(idxs, key=lambda x: meta[x]["start"])
+        # concat frames/bboxes/scores (keep gaps as gaps)
+        frames = np.concatenate([meta[x]["frames"] for x in idxs], axis=0)
+        bboxes = np.concatenate([meta[x]["bboxes"] for x in idxs], axis=0)
+        scs    = np.concatenate([meta[x]["scores"] for x in idxs], axis=0)
+
+        # sort by frame index just in case
+        order = np.argsort(frames)
+        frames = frames[order]
+        bboxes = bboxes[order]
+        scs    = scs[order]
+
+        # build a new track dict compatible with later code
+        track = {"frame": frames, "bbox": bboxes}
+        merged_vidTracks.append({"track": track})
+        merged_scores.append(scs)
+
+    return merged_vidTracks, merged_scores
+
+
+def filter_tracks_for_matching(
+    vidTracks,
+    scores,
+    fps=25,
+    prob_thr=0.5,
+    min_track_sec=2.0,
+    min_active_sec=0.8,
+    min_face_area=20*20
+):
+    """
+    Drop short/noisy/background tracks before matching.
+    """
+    kept_vid = []
+    kept_sc = []
+    for tr, sc in zip(vidTracks, scores):
+        frames = np.asarray(tr["track"]["frame"], dtype=int)
+        bboxes = np.asarray(tr["track"]["bbox"], dtype=np.float32)
+        sc = np.asarray(sc, dtype=np.float32)
+        L = min(len(frames), len(bboxes), len(sc))
+        if L <= 0:
+            continue
+        frames = frames[:L]; bboxes = bboxes[:L]; sc = sc[:L]
+
+        # length
+        if L < int(min_track_sec * fps):
+            continue
+
+        # face area (mean)
+        area_mean = float(np.mean([_bbox_area(x) for x in bboxes]))
+        if area_mean < float(min_face_area):
+            continue
+
+        # active frames
+        p = _sigmoid(sc)
+        active = int(np.sum(p >= prob_thr))
+        if active < int(min_active_sec * fps):
+            continue
+
+        kept_vid.append({"track": {"frame": frames, "bbox": bboxes}})
+        kept_sc.append(sc)
+
+    return kept_vid, kept_sc
+
+
+from scipy.optimize import linear_sum_assignment
+from scipy.io import wavfile
+
+def match_tracks_to_streams(P, V, B, sep_wavs, fps, n_frames, prob_thr=0.5, min_sim=0.05):
+    """
+    Robust matching with duration/active/size penalties.
+    Returns mapping track->stream and unmatched streams.
+    """
+    K = len(sep_wavs)
+    T = P.shape[0]
+    if T == 0 or K == 0:
+        return {}, list(range(K))
+
+    # energies
+    E = []
+    sr0 = None
+    for wp in sep_wavs:
+        sr, wav = wavfile.read(wp)
+        if sr0 is None: sr0 = sr
+        if sr != sr0:
+            raise ValueError(f"Sample rate mismatch: {sr0} vs {sr} for {wp}")
+        E.append(_rms_energy_frames(wav, sr, fps, n_frames))
+    E = np.stack(E, axis=0)  # (K,F)
+
+    # track stats for weighting
+    track_len = V.sum(axis=1).astype(np.float32)  # visible frames
+    active_len = np.nansum((P >= prob_thr) & V, axis=1).astype(np.float32)
+    # face size weight (mean area)
+    areas = np.zeros((T,), dtype=np.float32)
+    for t in range(T):
+        idx = np.where(V[t])[0]
+        if len(idx) == 0:
+            areas[t] = 0.0
+        else:
+            areas[t] = float(np.mean([_bbox_area(B[t, f]) for f in idx]))
+
+    # normalize weights
+    w_len = np.clip(track_len / (2.0 * fps), 0.0, 1.0)        # 2초 이상이면 1
+    w_act = np.clip(active_len / (1.0 * fps), 0.0, 1.0)       # 1초 이상 active면 1
+    w_size = np.clip(np.sqrt(areas / (80.0*80.0)), 0.0, 1.5)  # 80px 얼굴 기준, 너무 커지지 않게
+
+    # similarity matrix T x K
+    S = np.full((T, K), -1.0, dtype=np.float32)
+
+    for t in range(T):
+        m = V[t]
+        ov = int(m.sum())
+        if ov < int(0.5 * fps):  # 0.5초 미만은 거의 무시
+            continue
+
+        pt = P[t, m]
+        pt = (pt - np.nanmin(pt)) / (np.nanmax(pt) - np.nanmin(pt) + 1e-9)
+
+        for k in range(K):
+            ek = E[k, m]
+            ek = (ek - ek.min()) / (ek.max() - ek.min() + 1e-9)
+
+            corr = _safe_corr(pt.astype(np.float32), ek.astype(np.float32))
+            # duration/active/size weighting
+            sim = corr * w_len[t] * w_act[t] * w_size[t]
+            # 추가로 "짧은 트랙" 페널티를 조금 더 줌
+            sim = sim - 0.15 * (1.0 - w_len[t]) - 0.10 * (1.0 - w_act[t])
+
+            S[t, k] = sim
+
+    # Hungarian maximize (rectangular OK)
+    r, c = linear_sum_assignment(-S)
+
+    mapping = {}
+    assigned_streams = set()
+    for rr, cc in zip(r, c):
+        if float(S[rr, cc]) >= float(min_sim):
+            mapping[int(rr)] = int(cc)
+            assigned_streams.add(int(cc))
+
+    unmatched_streams = [i for i in range(K) if i not in assigned_streams]
+    return mapping, unmatched_streams
+
+
+
+def export_per_speaker_videos(args, vidTracks, scores, sep_wavs, thr=0.5, fps=25):
+    frame_files = sorted(glob.glob(os.path.join(args.pyframesPath, "*.jpg")))
+    n_frames = len(frame_files)
+    if n_frames == 0:
+        raise RuntimeError(f"No frames found in {args.pyframesPath}")
+
+    # ✅ 1) merge fragmented tracklets
+    vidTracks_m, scores_m = merge_tracklets(
+        args, vidTracks, scores,
+        max_gap_frames=12,
+        iou_thr=0.08,
+        center_thr=90.0,
+        size_ratio_thr=1.8,
+        hist_thr=0.55,
+        use_hist=True
+    )
+
+    # ✅ 2) filter short/background/noisy tracks
+    vidTracks_f, scores_f = filter_tracks_for_matching(
+        vidTracks_m, scores_m,
+        fps=fps, prob_thr=thr,
+        min_track_sec=2.0,
+        min_active_sec=0.8,
+        min_face_area=22*22
+    )
+
+    # build matrices
+    P, B, V = build_track_prob_and_bbox(vidTracks_f, scores_f, n_frames, use_sigmoid=True)
+
+    # ✅ 3) robust matching with penalties
+    mapping, unmatched = match_tracks_to_streams(
+        P=P, V=V, B=B,
+        sep_wavs=sep_wavs,
+        fps=fps, n_frames=n_frames,
+        prob_thr=thr,
+        min_sim=0.05
+    )
+    print("unmatched streams (off-screen candidates):", unmatched)
+
+    # 이후는 기존대로 mapping에 대해 track별 video 생성…
+    ...
