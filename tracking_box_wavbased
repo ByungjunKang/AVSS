@@ -1,0 +1,193 @@
+def assign_tracks_to_streams_many(
+    P, V, B, sep_wavs, fps, n_frames,
+    prob_thr=0.5,
+    min_sim=0.08,          # 너무 낮으면 배경 트랙이 붙음
+):
+    """
+    Hungarian(1:1) 대신, track마다 best stream을 선택(다대일).
+    반환:
+      track_to_stream: (T,) int, -1이면 미할당(=오프스크린/노이즈)
+      best_sim: (T,) float
+    """
+    K = len(sep_wavs)
+    T = P.shape[0]
+    if T == 0 or K == 0:
+        return np.full((T,), -1, dtype=int), np.full((T,), -1.0, dtype=np.float32)
+
+    # energies (K,F)
+    E = []
+    sr0 = None
+    for wp in sep_wavs:
+        sr, wav = wavfile.read(wp)
+        if sr0 is None: sr0 = sr
+        if sr != sr0:
+            raise ValueError(f"Sample rate mismatch: {sr0} vs {sr} for {wp}")
+        E.append(_rms_energy_frames(wav, sr, fps, n_frames))
+    E = np.stack(E, axis=0)
+
+    # track weights (짧은/비활성/작은 얼굴 페널티)
+    track_len = V.sum(axis=1).astype(np.float32)
+    active_len = np.nansum((P >= prob_thr) & V, axis=1).astype(np.float32)
+
+    areas = np.zeros((T,), dtype=np.float32)
+    for t in range(T):
+        idx = np.where(V[t])[0]
+        if len(idx) == 0:
+            areas[t] = 0.0
+        else:
+            areas[t] = float(np.mean([_bbox_area(B[t, f]) for f in idx]))
+
+    w_len = np.clip(track_len / (2.0 * fps), 0.0, 1.0)          # 2초 이상이면 1
+    w_act = np.clip(active_len / (1.0 * fps), 0.0, 1.0)         # 1초 이상 active면 1
+    w_size = np.clip(np.sqrt(areas / (80.0*80.0)), 0.0, 1.5)    # 얼굴 작으면 불리
+
+    track_to_stream = np.full((T,), -1, dtype=int)
+    best_sim = np.full((T,), -1.0, dtype=np.float32)
+
+    for t in range(T):
+        m = V[t]
+        if int(m.sum()) < int(0.6 * fps):  # 0.6초 미만이면 신뢰 낮음
+            continue
+
+        pt = P[t, m]
+        pt = (pt - np.nanmin(pt)) / (np.nanmax(pt) - np.nanmin(pt) + 1e-9)
+
+        sims = []
+        for k in range(K):
+            ek = E[k, m]
+            ek = (ek - ek.min()) / (ek.max() - ek.min() + 1e-9)
+
+            corr = _safe_corr(pt.astype(np.float32), ek.astype(np.float32))
+            sim = corr * w_len[t] * w_act[t] * w_size[t]
+            sim = sim - 0.15 * (1.0 - w_len[t]) - 0.10 * (1.0 - w_act[t])
+            sims.append(sim)
+
+        sims = np.asarray(sims, dtype=np.float32)
+        k_best = int(np.argmax(sims))
+        s_best = float(sims[k_best])
+
+        if s_best >= min_sim:
+            track_to_stream[t] = k_best
+            best_sim[t] = s_best
+
+    return track_to_stream, best_sim
+
+
+def build_stream_frame_boxes(P, V, B, track_to_stream, n_streams):
+    """
+    stream k마다, 프레임 f에서 가장 그럴듯한 bbox 1개를 선택.
+    기준: score = P(t,f) * sqrt(area(bbox))
+    반환:
+      SB: (K,F,4) float32, vis 아닌 곳은 0
+      SP: (K,F) speaking prob (선택된 트랙의 P)
+      SV: (K,F) bool visibility
+    """
+    T, F = P.shape
+    K = n_streams
+    SB = np.zeros((K, F, 4), dtype=np.float32)
+    SP = np.full((K, F), -1.0, dtype=np.float32)
+    SV = np.zeros((K, F), dtype=bool)
+
+    best_score = np.full((K, F), -1e9, dtype=np.float32)
+
+    for t in range(T):
+        k = int(track_to_stream[t])
+        if k < 0 or k >= K:
+            continue
+        idx = np.where(V[t])[0]
+        for f in idx:
+            p = float(P[t, f])
+            area = float(_bbox_area(B[t, f]))
+            s = p * math.sqrt(max(area, 1.0))
+            if s > best_score[k, f]:
+                best_score[k, f] = s
+                SB[k, f] = B[t, f]
+                SP[k, f] = p
+                SV[k, f] = True
+
+    return SB, SP, SV
+
+
+def export_per_stream_videos(args, vidTracks, scores, sep_wavs, thr=0.5, fps=25):
+    frame_files = sorted(glob.glob(os.path.join(args.pyframesPath, "*.jpg")))
+    n_frames = len(frame_files)
+    if n_frames == 0:
+        raise RuntimeError(f"No frames found in {args.pyframesPath}")
+
+    # (선택) merge/filter를 먼저 해도 되고, 시각화 목적이면 filter만 너무 세게 걸지 않아도 됨
+    # 여기서는 "박스가 많이 나오도록" filter는 약하게 권장
+    vidTracks_m, scores_m = merge_tracklets(
+        args, vidTracks, scores,
+        max_gap_frames=12, iou_thr=0.08, center_thr=90.0,
+        size_ratio_thr=1.8, hist_thr=0.55, use_hist=True
+    )
+
+    # 너무 짧은 배경 트랙만 제거
+    vidTracks_f, scores_f = filter_tracks_for_matching(
+        vidTracks_m, scores_m,
+        fps=fps, prob_thr=thr,
+        min_track_sec=1.2,     # 시각화는 좀 느슨하게
+        min_active_sec=0.4,
+        min_face_area=18*18
+    )
+
+    P, B, V = build_track_prob_and_bbox(vidTracks_f, scores_f, n_frames, use_sigmoid=True)
+
+    # ✅ 다대일(track→stream) 할당으로 "같은 화자 tracklet" 묶기
+    track_to_stream, best_sim = assign_tracks_to_streams_many(
+        P, V, B, sep_wavs, fps=fps, n_frames=n_frames,
+        prob_thr=thr, min_sim=0.08
+    )
+
+    # ✅ stream별 프레임 bbox 선택
+    SB, SP, SV = build_stream_frame_boxes(P, V, B, track_to_stream, n_streams=len(sep_wavs))
+
+    out_dir = os.path.join(args.savePath, "pyavi_speakers")
+    os.makedirs(out_dir, exist_ok=True)
+
+    img0 = cv2.imread(frame_files[0])
+    H, W = img0.shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*"XVID")
+
+    for k, wav_path in enumerate(sep_wavs):
+        # 이 stream이 화면에 충분히 매핑되지 않으면(=오프스크린) 스킵
+        vis_cnt = int(SV[k].sum())
+        if vis_cnt < int(0.8 * fps):  # 0.8초 미만이면 skip
+            continue
+
+        # (옵션) 짧은 gap 보간
+        boxes = SB[k]
+        vis = SV[k]
+
+        video_only = os.path.join(out_dir, f"speaker{ k:02d }_video_only.avi")
+        video_out  = os.path.join(out_dir, f"speaker{ k:02d }_out.mp4")
+
+        vw = cv2.VideoWriter(video_only, fourcc, fps, (W, H))
+        if not vw.isOpened():
+            raise RuntimeError(f"Failed to open VideoWriter for {video_only}")
+
+        for fidx, fp in enumerate(frame_files):
+            img = cv2.imread(fp)
+
+            if vis[fidx]:
+                p = float(SP[k, fidx]) if SP[k, fidx] >= 0 else 0.0
+                x1, y1, x2, y2 = boxes[fidx].astype(int).tolist()
+                color = (0, 255, 0) if p >= thr else (0, 0, 255)
+
+                cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(img, f"SPK{k} p={p:.2f}", (x1, max(0, y1-5)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+            vw.write(img)
+
+        vw.release()
+
+        # 오디오는 해당 stream wav로 mux
+        cmd = (
+            f'ffmpeg -y -i "{video_only}" -i "{wav_path}" '
+            f'-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -shortest "{video_out}" -loglevel error'
+        )
+        subprocess.call(cmd, shell=True)
+
+
+export_per_stream_videos(args, vidTracks, scores, sep_wavs, thr=args.as_thr, fps=25)
