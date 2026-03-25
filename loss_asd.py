@@ -18,6 +18,39 @@ def calc_si_sdr(est, ref, eps=1e-8):
     si_sdr = 10 * torch.log10(val + eps)
     return si_sdr
 
+import torch
+import torch.nn.functional as F
+
+def calc_snr(est, ref, eps=1e-8):
+    """
+    Scale-Dependent SNR 계산 (파형의 모양뿐만 아니라 '볼륨 크기'까지 맞추도록 강제함)
+    est, ref shape: (B, T)
+    """
+    # 원본 신호의 에너지
+    target_energy = torch.norm(ref, dim=-1)**2
+    
+    # 정답과 추론값의 절대적인 차이(Noise) 에너지
+    noise = est - ref
+    noise_energy = torch.norm(noise, dim=-1)**2
+    
+    # SNR (dB) - 크기가 달라지면 noise_energy가 커져서 페널티를 받음
+    snr = 10 * torch.log10((target_energy + eps) / (noise_energy + eps))
+    return snr
+
+def cal_tse_loss(est_sources, ref_sources):
+    """
+    est_sources: (B, 2, T) - [Target, Interference]
+    ref_sources: (B, 2, T) - [Target, Interference]
+    """
+    # SI-SDR 대신 SNR 적용
+    loss_target = -calc_snr(est_sources[:, 0, :], ref_sources[:, 0, :]).mean()
+    loss_interf = -calc_snr(est_sources[:, 1, :], ref_sources[:, 1, :]).mean()
+    
+    total_loss = loss_target + loss_interf
+    
+    return total_loss, loss_target, loss_interf
+
+
 def cal_tse_loss(est_sources, ref_sources, noise_weight=0.1):
     """
     est_sources: (B, 3, T) - [Target, Interference, Noise]
