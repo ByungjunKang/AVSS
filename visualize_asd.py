@@ -1,19 +1,27 @@
 import cv2
 import numpy as np
 import os
+import pickle
+import glob
+import argparse
 
-def visualize_asd_tracks(video_path, all_tracks, asd_scores_dict, output_path, fps=25):
-    """
-    video_path: 원본 영상 (.mp4)
-    all_tracks: 트래커가 반환한 전체 궤적 리스트 (원본 프레임 인덱스와 bbox 포함)
-    asd_scores_dict: {track_id: np.array(asd_scores)} 형태의 딕셔너리
-    output_path: 결과물이 저장될 영상 경로
-    """
+def visualize_video(video_path, meta_path, npy_dir, output_path, fps=25):
+    # 1. 메타데이터 및 스코어 로드
+    with open(meta_path, 'rb') as f:
+        tracks_meta = pickle.load(f)
+        
+    video_basename = os.path.splitext(os.path.basename(video_path))[0]
+    scores_dict = {}
+    
+    for track_id in tracks_meta.keys():
+        npy_path = os.path.join(npy_dir, f"{video_basename}_track{track_id}.npy")
+        if os.path.exists(npy_path):
+            scores_dict[track_id] = np.load(npy_path)
+            
+    # 2. 비디오 라이터 세팅
     cap = cv2.VideoCapture(video_path)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
-    # MP4 코덱 설정
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     
@@ -23,44 +31,48 @@ def visualize_asd_tracks(video_path, all_tracks, asd_scores_dict, output_path, f
         if not ret:
             break
             
-        # 현재 프레임에 해당하는 모든 트랙 검사
-        for track_id, track_info in enumerate(all_tracks):
-            if track_id not in asd_scores_dict:
-                continue # 필터링되어 점수가 없는 트랙은 패스
+        # 3. 현재 프레임에 존재하는 모든 얼굴 박스 그리기
+        for track_id, meta in tracks_meta.items():
+            if track_id not in scores_dict:
+                continue
                 
-            frames_list = track_info["track"]["frame"]
+            frames_list = meta['frame'].tolist() if isinstance(meta['frame'], np.ndarray) else meta['frame']
             
-            # 이 화자가 현재 프레임에 존재하는 경우
             if frame_idx in frames_list:
-                # 리스트 내 인덱스 찾기
+                # 리스트 내 인덱스를 찾아 바운딩 박스와 스코어 매칭
                 idx = frames_list.index(frame_idx)
-                bbox = track_info["track"]["bbox"][idx]
-                score = asd_scores_dict[track_id][idx]
+                
+                # 영상 길이와 스코어 길이가 미세하게 다를 수 있는 에지 케이스 방어
+                if idx >= len(scores_dict[track_id]):
+                    idx = len(scores_dict[track_id]) - 1
+                    
+                bbox = meta['bbox'][idx]
+                score = scores_dict[track_id][idx]
                 
                 x1, y1, x2, y2 = map(int, bbox)
                 
-                # 시각적 피드백: Score가 0 이상(Active)이면 초록색, 미만(Inactive)이면 빨간색
-                # (만약 이미 Sigmoid를 통과한 확률값이라면 기준을 0.5로 설정하세요)
+                # 시각적 피드백: 로짓 기준 0 이상이면 초록색(Active), 미만이면 빨간색(Inactive)
                 color = (0, 255, 0) if score > 0.0 else (0, 0, 255)
                 
-                # Bounding Box 그리기
+                # 박스 및 텍스트 오버레이
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                
-                # ID 및 Score 텍스트 오버레이
-                text = f"ID:{track_id} Score:{score:.2f}"
+                text = f"ID:{track_id} | ASD:{score:.1f}"
                 cv2.putText(frame, text, (x1, max(20, y1 - 10)), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         
         out.write(frame)
         frame_idx += 1
         
     cap.release()
     out.release()
-    print(f"✅ Visualization saved to {output_path}")
+    print(f"✅ Visualization complete: {output_path}")
 
-# --- 사용 예시 ---
-# asd_scores_dict = {
-#     0: np.load("mix_track0.npy"),
-#     1: np.load("mix_track1.npy")
-# }
-# visualize_asd_tracks("test_video.mp4", all_tracks, asd_scores_dict, "test_video_asd_viz.mp4")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--video_path", required=True, help="Path to original .mp4")
+    parser.add_argument("--meta_path", required=True, help="Path to extracted _meta.pkl")
+    parser.add_argument("--npy_dir", required=True, help="Directory containing _trackX.npy files")
+    parser.add_argument("--output_path", default="output_viz.mp4", help="Path to save visualization")
+    args = parser.parse_args()
+    
+    visualize_video(args.video_path, args.meta_path, args.npy_dir, args.output_path)
