@@ -49,17 +49,15 @@ def process_video_batch_resync(video_dir, asd_dir, output_dir, target_fps=25):
         print(f"🎥 {video_basename}: Source {source_fps:.2f}fps -> Target {target_fps}fps Syncing...")
 
         frame_idx = 0
+        target_frame_idx = 0  # 🚀 [추가] 25fps 기준 몇 번째 프레임을 써야 하는지 추적
+
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
             
-            # 🚀 [핵심] 시간 기반 프레임 매핑 로직
-            # 원본 영상의 현재 시간(초)을 계산
+            # 현재 원본 영상의 시간(초)
             current_time_sec = frame_idx / source_fps
-            
-            # 해당 시간에 대응하는 25fps 기준의 메타데이터 인덱스를 찾음
-            # (Round를 사용하여 가장 가까운 프레임을 선택)
             meta_idx = int(round(current_time_sec * target_fps))
             
             for track_id, scores in top_tracks.items():
@@ -93,10 +91,14 @@ def process_video_batch_resync(video_dir, asd_dir, output_dir, target_fps=25):
             # 영상이 미세하게 슬로우 모션이 됩니다. 
             # 완벽한 싱크를 위해선 target_fps 주기에 맞는 프레임만 out.write해야 합니다.
             
-            # [수정된 OLA 방식] target_fps 주기에 해당하는 프레임만 샘플링하여 저장
-            target_frame_counter = int(frame_idx * (target_fps / source_fps))
-            if frame_idx == int(target_frame_counter * (source_fps / target_fps)):
+            # 🚀 [수정됨] 확실한 타임스탬프 기반 프레임 기록 (Frame Dropping)
+            # 타겟 영상(25fps)에서 현재 써야 할 프레임의 시간 위치
+            expected_target_time = target_frame_idx / target_fps
+            
+            # 원본 영상의 시간이 타겟 시간 이상이 될 때만 프레임을 기록
+            if current_time_sec >= expected_target_time:
                 out.write(frame)
+                target_frame_idx += 1  # 다음 타겟 프레임 기록 준비
                 
             frame_idx += 1
             
