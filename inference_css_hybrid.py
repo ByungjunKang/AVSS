@@ -51,6 +51,8 @@ class AdvancedHybridMatcher:
 
     def match(self, est_sources, asd_scores, chunk_idx):
         K, N = est_sources.shape[0], asd_scores.shape[0]
+        T_chunk = est_sources.shape[-1] # 오디오 길이 (32000)
+        
         S_total = torch.zeros(K, N)
         
         # 로짓(-10~10)을 확률(0~1)로 변환
@@ -78,7 +80,7 @@ class AdvancedHybridMatcher:
                     S_total[k, n] = score_aud_long
                     
         row_ind, col_ind = linear_sum_assignment(-S_total.numpy())
-        aligned_sources = torch.zeros_like(est_sources)
+        aligned_sources = torch.zeros((N, T_chunk), dtype=est_sources.dtype, device=est_sources.device)
         
         for r, c in zip(row_ind, col_ind):
             aligned_wav = est_sources[r]
@@ -140,9 +142,9 @@ def main():
             asd_lengths = [(f, np.load(f).shape[-1]) for f in asd_files]
             asd_lengths.sort(key=lambda x: x[1], reverse=True)
             
-            # 🚀 [핵심] 가장 긴 얼굴 최대 2개만 선택
-            top_asd_files = [x[0] for x in asd_lengths[:2]]
-            N_speakers = len(top_asd_files)
+            # 🚀 [수정됨] 화자가 1명이면 1개만, 2명 이상이면 가장 긴 2개만 추출
+            N_speakers = min(2, len(asd_lengths))
+            top_asd_files = [x[0] for x in asd_lengths[:N_speakers]]
             print(f"\nProcessing {audio_basename}: Selected {N_speakers} longest tracks.")
 
             # 오디오 로드 및 필요시 리샘플링
@@ -189,7 +191,8 @@ def main():
                 asd_chunk = asd_matrix[:, start_frame:end_frame] # (N, 50)
                 
                 # A. Audio-only 모델 추론 (Permutation 섞임)
-                est_sources = model(mix_chunk).squeeze(0).cpu() # (2, 32000)
+                est_sources = model(mix_chunk).squeeze(0).cpu() # (3, 32000)
+                est_sources = est_sources[:2, :]
                 
                 # B. Hybrid 매칭 (정렬 수행)
                 aligned_chunk = matcher.match(est_sources, asd_chunk, chunk_idx) # (N, 32000)
