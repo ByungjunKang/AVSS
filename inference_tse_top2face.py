@@ -105,4 +105,24 @@ def main():
                     asd_input = asd_tensor[..., :expected_frames].view(1, 1, expected_frames).to(device)
 
                 # C. 모델 추론 (FiLM 레이어로 시각 정보 주입)
-                ests_speech = model(mixture_input, asd
+                ests_speech = model(mixture_input, asd_input) 
+                
+                # D. Output Processing & Saving
+                ests_speech = ests_speech.squeeze(0).cpu()
+                
+                # 채널 0은 Target(시각 정보에 대응)
+                target_wav = ests_speech[0].unsqueeze(0)
+                
+                target_out_name = f"{audio_basename}_track{track_id}_target.wav"
+                target_out_path = os.path.join(args.output_dir, target_out_name)
+                
+                try:
+                    torchaudio.save(target_out_path, target_wav, target_sr)
+                    print(f"  └─ Saved: {target_out_name}")
+                except Exception as e:
+                    print(f"  └─ ❌ Error saving {target_out_path}: {e}")
+
+    print(f"\n🎉 Processing complete! Results are in: {args.output_dir}")
+
+if __name__ == "__main__":
+    main()
