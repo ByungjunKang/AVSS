@@ -1,0 +1,217 @@
+import os
+import glob
+import argparse
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torchaudio
+import torchaudio.transforms as T
+from scipy.optimize import linear_sum_assignment
+
+# -------------------------------------------------------------------------
+# 1. Hybrid Matcher & Golden Feature Buffer 클래스
+# -------------------------------------------------------------------------
+class GoldenFeatureBuffer:
+    def __init__(self, sr=16000, n_mfcc=20, ema_alpha=0.8):
+        self.mfcc_transform = T.MFCC(sample_rate=sr, n_mfcc=n_mfcc)
+        self.golden_profiles = {}
+        self.ema_alpha = ema_alpha
+
+    def _get_vocal_profile(self, wav_tensor):
+        mfcc = self.mfcc_transform(wav_tensor)
+        return mfcc.mean(dim=-1)
+
+    def update(self, track_id, wav_tensor):
+        new_profile = self._get_vocal_profile(wav_tensor)
+        if track_id not in self.golden_profiles:
+            self.golden_profiles[track_id] = new_profile
+        else:
+            self.golden_profiles[track_id] = (self.ema_alpha * self.golden_profiles[track_id]) + \
+                                             ((1 - self.ema_alpha) * new_profile)
+
+    def get_similarity(self, track_id, wav_tensor):
+        if track_id not in self.golden_profiles:
+            return 0.0
+        current_profile = self._get_vocal_profile(wav_tensor)
+        prof_a = current_profile.unsqueeze(0)
+        prof_b = self.golden_profiles[track_id].unsqueeze(0)
+        return max(0.0, F.cosine_similarity(prof_a, prof_b).item())
+
+
+class AdvancedHybridMatcher:
+    def __init__(self, sr=16000, overlap_sec=1.0):
+        self.overlap_samples = int(overlap_sec * sr)
+        self.golden_buffer = GoldenFeatureBuffer(sr=sr)
+        self.history = {}
+        self.golden_vis_thresh = 0.9  
+        self.active_rms_thresh = 0.01 # 실험적으로 조절 필요 (침묵 임계치)
+
+    def _calc_rms(self, wav):
+        return torch.sqrt(torch.mean(wav**2, dim=-1) + 1e-9)
+
+    def match(self, est_sources, asd_scores, chunk_idx):
+        K, N = est_sources.shape[0], asd_scores.shape[0]
+        S_total = torch.zeros(K, N)
+        
+        # 로짓(-10~10)을 확률(0~1)로 변환
+        asd_probs = torch.sigmoid(asd_scores)
+        max_vis_scores, _ = torch.max(asd_probs, dim=-1)
+        
+        for n in range(N):
+            vis_conf = max_vis_scores[n].item()
+            for k in range(K):
+                score_vis = vis_conf
+                score_aud_short = 0.0
+                if chunk_idx > 0 and n in self.history and self.history[n]['is_active']:
+                    prev_tail = self.history[n]['overlap_wav']
+                    curr_head = est_sources[k, :self.overlap_samples]
+                    score_aud_short = torch.mean(F.normalize(prev_tail, dim=0) * F.normalize(curr_head, dim=0)).item()
+                
+                score_aud_long = self.golden_buffer.get_similarity(n, est_sources[k])
+                
+                # Dynamic Routing
+                if vis_conf > 0.8:
+                    S_total[k, n] = score_vis
+                elif score_aud_short > 0.5:
+                    S_total[k, n] = score_aud_short
+                else:
+                    S_total[k, n] = score_aud_long
+                    
+        row_ind, col_ind = linear_sum_assignment(-S_total.numpy())
+        aligned_sources = torch.zeros_like(est_sources)
+        
+        for r, c in zip(row_ind, col_ind):
+            aligned_wav = est_sources[r]
+            aligned_sources[c] = aligned_wav
+            
+            if max_vis_scores[c] > self.golden_vis_thresh and self._calc_rms(aligned_wav) > self.active_rms_thresh:
+                self.golden_buffer.update(c, aligned_wav)
+                
+            tail_wav = aligned_wav[-self.overlap_samples:]
+            self.history[c] = {
+                "overlap_wav": tail_wav,
+                "is_active": self._calc_rms(tail_wav) > self.active_rms_thresh
+            }
+            
+        return aligned_sources
+
+# -------------------------------------------------------------------------
+# 2. 메인 추론 루프 (Chunking, Filtering, OLA)
+# -------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--audio_dir", required=True)
+    parser.add_argument("--asd_dir", required=True)
+    parser.add_argument("--output_dir", default="separated_css_hybrid")
+    parser.add_argument("--ckpt_path", required=True, help="Path to AUDIO-ONLY TIGER model checkpoint")
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # [주의] 이 접근법은 FiLM이 없는 오리지널 Audio-only TIGER 모델을 로드해야 합니다.
+    import look2hear.models
+    model = look2hear.models.TIGER(out_channels=128, in_channels=256, num_blocks=8, num_sources=2)
+    ckpt = torch.load(args.ckpt_path, map_location=device)
+    state_dict = ckpt.get('state_dict', ckpt)
+    model.load_state_dict({k.replace('audio_model.', ''): v for k, v in state_dict.items()}, strict=True)
+    model.to(device).eval()
+
+    sr, fps = 16000, 25
+    chunk_sec, overlap_sec = 2.0, 1.0
+    chunk_samples = int(chunk_sec * sr)
+    stride_samples = int((chunk_sec - overlap_sec) * sr)
+    chunk_frames = int(chunk_sec * fps)
+    stride_frames = int((chunk_sec - overlap_sec) * fps)
+
+    # 1. 처리할 오디오 파일 순회
+    audio_files = glob.glob(os.path.join(args.audio_dir, "*.wav"))
+    
+    with torch.no_grad():
+        for audio_path in audio_files:
+            audio_basename = os.path.splitext(os.path.basename(audio_path))[0]
+            
+            # 2. 다화자 필터링: 해당 영상의 ASD 파일들을 찾고 길이에 따라 정렬
+            asd_files = glob.glob(os.path.join(args.asd_dir, f"{audio_basename}_track*.npy"))
+            if not asd_files:
+                continue
+                
+            # (파일 경로, 길이) 튜플 리스트 생성 후 길이 기준 내림차순 정렬
+            asd_lengths = [(f, np.load(f).shape[-1]) for f in asd_files]
+            asd_lengths.sort(key=lambda x: x[1], reverse=True)
+            
+            # 🚀 [핵심] 가장 긴 얼굴 최대 2개만 선택
+            top_asd_files = [x[0] for x in asd_lengths[:2]]
+            N_speakers = len(top_asd_files)
+            print(f"\nProcessing {audio_basename}: Selected {N_speakers} longest tracks.")
+
+            # 오디오 로드 및 필요시 리샘플링
+            wav, orig_sr = torchaudio.load(audio_path)
+            if orig_sr != sr:
+                wav = T.Resample(orig_sr, sr)(wav)
+            wav = wav[0] # (T_audio,)
+            
+            # ASD 데이터 병합 (N, T_video)
+            max_video_len = int((wav.shape[0] / sr) * fps)
+            asd_matrix = torch.full((N_speakers, max_video_len), -10.0) # 기본값 -10 (확률 0)
+            
+            for i, f in enumerate(top_asd_files):
+                data = torch.from_numpy(np.load(f)).float()
+                L = min(data.shape[-1], max_video_len)
+                asd_matrix[i, :L] = data[:L]
+            
+            # 3. Overlap-Add (OLA) 버퍼 초기화
+            total_samples = wav.shape[0]
+            out_buffer = torch.zeros(N_speakers, total_samples)
+            window_sum = torch.zeros(1, total_samples)
+            
+            # Hann Window를 사용하여 자연스러운 Crossfade 유도
+            window = torch.hann_window(chunk_samples)
+            matcher = AdvancedHybridMatcher(sr=sr, overlap_sec=overlap_sec)
+
+            # 4. Chunk 단위 순회 (스트리밍 시뮬레이션)
+            num_chunks = (total_samples - chunk_samples) // stride_samples + 1
+            if total_samples < chunk_samples: 
+                num_chunks = 1
+            
+            for chunk_idx in range(num_chunks):
+                start_samp = chunk_idx * stride_samples
+                end_samp = start_samp + chunk_samples
+                
+                start_frame = chunk_idx * stride_frames
+                end_frame = start_frame + chunk_frames
+                
+                # 끝부분 패딩 방어
+                if end_samp > total_samples:
+                    break 
+
+                mix_chunk = wav[start_samp:end_samp].unsqueeze(0).unsqueeze(0).to(device) # (1, 1, 32000)
+                asd_chunk = asd_matrix[:, start_frame:end_frame] # (N, 50)
+                
+                # A. Audio-only 모델 추론 (Permutation 섞임)
+                est_sources = model(mix_chunk).squeeze(0).cpu() # (2, 32000)
+                
+                # B. Hybrid 매칭 (정렬 수행)
+                aligned_chunk = matcher.match(est_sources, asd_chunk, chunk_idx) # (N, 32000)
+                
+                # C. Overlap-Add
+                weighted_chunk = aligned_chunk * window.unsqueeze(0)
+                out_buffer[:, start_samp:end_samp] += weighted_chunk
+                window_sum[:, start_samp:end_samp] += window
+
+            # 5. 후처리 및 저장
+            # Window가 겹치지 않아 0이 된 부분 방어
+            window_sum[window_sum < 1e-9] = 1.0 
+            final_audio = out_buffer / window_sum
+            
+            for i, f in enumerate(top_asd_files):
+                # 파일명에서 원본 트랙 ID 추출 (예: video_track1.npy -> 1)
+                track_id = os.path.splitext(os.path.basename(f))[0].split("_track")[-1]
+                
+                out_name = f"{audio_basename}_track{track_id}_hybrid_target.wav"
+                out_path = os.path.join(args.output_dir, out_name)
+                torchaudio.save(out_path, final_audio[i].unsqueeze(0), sr)
+                print(f"Saved: {out_name}")
+
+if __name__ == "__main__":
+    main()
