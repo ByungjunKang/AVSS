@@ -51,32 +51,46 @@ class AdvancedHybridMatcher:
 
     def match(self, est_sources, asd_scores, chunk_idx):
         K, N = est_sources.shape[0], asd_scores.shape[0]
-        T_chunk = est_sources.shape[-1] # 오디오 길이 (32000)
+        T_chunk = est_sources.shape[-1]
         
         S_total = torch.zeros(K, N)
         
-        # 로짓(-10~10)을 확률(0~1)로 변환
+        # 1. 로짓을 확률로 변환 (-10.0은 거의 0.0이 됨)
         asd_probs = torch.sigmoid(asd_scores)
-        max_vis_scores, _ = torch.max(asd_probs, dim=-1)
+        max_vis_scores, _ = torch.max(asd_probs, dim=-1) # (N,)
         
         for n in range(N):
-            vis_conf = max_vis_scores[n].item()
+            vis_prob = max_vis_scores[n].item()
+            
+            # 🚀 [수정 포인트] 이 청크에 유효한 얼굴 점수가 있는가?
+            # -10.0 로짓은 시그모이드 통과 시 약 0.000045입니다. 
+            # 따라서 0.01보다 작다면 이 청크에서 이 화자는 '완전 실종'된 것으로 간주합니다.
+            is_vis_present = vis_prob > 0.01 
+            
             for k in range(K):
-                score_vis = vis_conf
+                # (A) 시각 유사도 (얼굴이 있을 때만 유효)
+                score_vis = vis_prob if is_vis_present else 0.0
+                
+                # (B) 단기 오디오 유사도 (Overlap 파형)
                 score_aud_short = 0.0
                 if chunk_idx > 0 and n in self.history and self.history[n]['is_active']:
                     prev_tail = self.history[n]['overlap_wav']
                     curr_head = est_sources[k, :self.overlap_samples]
+                    # 코사인 유사도 기반 파형 매칭
                     score_aud_short = torch.mean(F.normalize(prev_tail, dim=0) * F.normalize(curr_head, dim=0)).item()
                 
+                # (C) 장기 오디오 유사도 (Golden MFCC Profile)
                 score_aud_long = self.golden_buffer.get_similarity(n, est_sources[k])
                 
-                # Dynamic Routing
-                if vis_conf > 0.8:
+                # 🚀 [수정된 하이브리드 라우팅]
+                if is_vis_present and vis_prob > 0.8:
+                    # 얼굴이 확실하게 나타나면 비주얼 가이드 우선 (Anchor Reset)
                     S_total[k, n] = score_vis
-                elif score_aud_short > 0.5:
+                elif score_aud_short > 0.4: # 임계치를 살짝 낮춰 연속성을 확보
+                    # 얼굴이 없거나 흐릿해도, 방금 전까지 하던 말이 이어지면 오디오 트래킹
                     S_total[k, n] = score_aud_short
                 else:
+                    # 턴테이킹 후 재등장 등 모든 게 불확실할 때 마지막 보루인 Golden Feature 활용
                     S_total[k, n] = score_aud_long
                     
         row_ind, col_ind = linear_sum_assignment(-S_total.numpy())
