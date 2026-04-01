@@ -186,7 +186,6 @@ def process_single_video(video_path, output_npy_path, DET, ASD_model):
     args.minFaceSize = 1
     args.cropScale = 0.40
     
-    # 임시 폴더 설정 (충돌 방지를 위해 비디오 이름을 포함)
     vid_name = os.path.basename(video_path).replace('.mp4', '')
     args.savePath = os.path.join('./temp_workspace', vid_name)
     
@@ -221,42 +220,54 @@ def process_single_video(video_path, output_npy_path, DET, ASD_model):
                 allTracks.extend(track_shot(args, faces[shot[0].frame_num:shot[1].frame_num]))
                 
         if len(allTracks) == 0:
-            return False # 얼굴을 하나도 찾지 못함
-
-        # ... (이전 코드: scene, faces 추출 및 allTracks 확보까지 동일) ...
-
-        if len(allTracks) == 0:
-            return False # 얼굴을 하나도 찾지 못함
+            return False 
             
-        # 3. 모든 트랙 순회하며 개별 화자 추출 및 메타데이터 저장
+        # 🚀 [핵심 추가] 노이즈 궤적 필터링 및 가장 긴 얼굴 Top-2 정렬
+        valid_tracks = [t for t in allTracks if len(t['frame']) >= 25]
+        valid_tracks.sort(key=lambda x: len(x['frame']), reverse=True)
+        top_tracks = valid_tracks[:2] # Top-2만 슬라이싱
+        
+        if len(top_tracks) == 0:
+            return False 
+
+        # 원본 오디오 길이를 기반으로 전체 프레임 수(Global Canvas Size) 계산
+        from scipy.io import wavfile
+        _, full_audio = wavfile.read(args.audioFilePath)
+        total_audio_sec = len(full_audio) / 16000.0
+        total_frames = int(total_audio_sec * 25)
+
         import pickle
         valid_tracks_info = {}
         
-        for track_id, track in enumerate(allTracks):
-            # 너무 짧은 궤적 (예: 25프레임 / 1초 미만)은 노이즈로 간주하고 무시
-            if len(track['frame']) < 25:
-                continue
-                
+        # 3. Top-2 트랙만 순회하며 무거운 연산 수행
+        for track_id, track in enumerate(top_tracks):
             # 4. 개별 트랙 Crop
             crop_file_path = os.path.join(args.pycropPath, f'track_{track_id}')
             crop_video(args, track, crop_file_path)
             
-            # 5. 추출된 ASD Score (1D numpy array)
+            # 5. 추출된 ASD Score 
             scores = evaluate_network_single(crop_file_path + '.avi', ASD_model)
             
-            # 6. 최종 npy 저장 (track_id 명시)
+            # 🚀 [절대 시간 복원 로직] 전체 영상 길이의 캔버스 생성 및 침묵 초기화
+            global_scores = numpy.full(total_frames, -10.0, dtype=numpy.float32)
+            frames_list = track['frame'].tolist() if isinstance(track['frame'], numpy.ndarray) else track['frame']
+            
+            valid_len = min(len(scores), len(frames_list))
+            for i in range(valid_len):
+                global_idx = frames_list[i]
+                if global_idx < total_frames:
+                    global_scores[global_idx] = scores[i]
+            
+            # 6. 최종 npy 저장 (track_id는 항상 0 또는 1이 됨)
             track_npy_path = output_npy_path.replace('.npy', f'_track{track_id}.npy')
             os.makedirs(os.path.dirname(track_npy_path), exist_ok=True)
-            numpy.save(track_npy_path, scores)
+            numpy.save(track_npy_path, global_scores)
             
             # 7. 시각화를 위한 바운딩 박스 메타데이터 수집
             valid_tracks_info[track_id] = {
-                'frame': track['frame'],   # 프레임 인덱스 배열
-                'bbox': track['bbox']      # 원본 영상 기준 [x1, y1, x2, y2] 좌표 배열
+                'frame': track['frame'],   
+                'bbox': track['bbox']      
             }
-        
-        if not valid_tracks_info:
-            return False # 필터링 후 남은 유효한 얼굴이 없음
             
         # 8. 메타데이터(.pkl) 저장
         meta_pkl_path = output_npy_path.replace('.npy', '_meta.pkl')
@@ -266,7 +277,7 @@ def process_single_video(video_path, output_npy_path, DET, ASD_model):
         return True
         
     finally:
-        # 9. 디스크 용량 관리를 위해 임시 폴더 즉각 삭제
+        # 9. 임시 폴더 삭제
         rmtree(args.savePath, ignore_errors=True)
 
 # ==========================================================
