@@ -38,16 +38,53 @@ class GoldenFeatureBuffer:
         return max(0.0, F.cosine_similarity(prof_a, prof_b).item())
 
 
+import torch
+import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment
+import torchaudio.transforms as T
+
+# (GoldenFeatureBuffer 클래스는 기존과 완벽히 동일하므로 생략)
+
 class AdvancedHybridMatcher:
-    def __init__(self, sr=16000, overlap_sec=1.0):
+    def __init__(self, sr=16000, overlap_sec=1.0, video_fps=25):
+        self.sr = sr
+        self.video_fps = video_fps
         self.overlap_samples = int(overlap_sec * sr)
         self.golden_buffer = GoldenFeatureBuffer(sr=sr)
         self.history = {}
+        
         self.golden_vis_thresh = 0.9  
-        self.active_rms_thresh = 0.01 # 실험적으로 조절 필요 (침묵 임계치)
+        self.active_rms_thresh = 0.01 
 
     def _calc_rms(self, wav):
         return torch.sqrt(torch.mean(wav**2, dim=-1) + 1e-9)
+
+    # 🚀 [추가됨] 진정한 Audio-Visual Correlation 계산 로직
+    def _calc_av_correlation(self, wav, asd_probs):
+        """오디오 에너지 엔벨로프와 ASD 확률 궤적 간의 피어슨 상관계수 계산"""
+        frame_len = self.sr // self.video_fps # 16000 / 25 = 640 samples per frame
+        T_video = asd_probs.shape[0]
+        
+        # 1. 오디오를 비디오 프레임 길이에 맞게 패딩/크롭
+        req_samples = T_video * frame_len
+        if wav.shape[0] < req_samples:
+            wav_padded = F.pad(wav, (0, req_samples - wav.shape[0]))
+        else:
+            wav_padded = wav[:req_samples]
+            
+        # 2. 프레임 단위로 쪼개서 RMS 에너지 추출 (T_video,)
+        wav_frames = wav_padded.view(T_video, frame_len)
+        audio_env = self._calc_rms(wav_frames)
+        
+        # 3. Pearson Correlation 계산 (-1.0 ~ 1.0)
+        a_env = audio_env - audio_env.mean()
+        v_env = asd_probs - asd_probs.mean()
+        
+        a_norm = torch.norm(a_env) + 1e-8
+        v_norm = torch.norm(v_env) + 1e-8
+        
+        corr = torch.sum(a_env * v_env) / (a_norm * v_norm)
+        return corr.item()
 
     def match(self, est_sources, asd_scores, chunk_idx):
         K, N = est_sources.shape[0], asd_scores.shape[0]
@@ -55,42 +92,40 @@ class AdvancedHybridMatcher:
         
         S_total = torch.zeros(K, N)
         
-        # 1. 로짓을 확률로 변환 (-10.0은 거의 0.0이 됨)
         asd_probs = torch.sigmoid(asd_scores)
-        max_vis_scores, _ = torch.max(asd_probs, dim=-1) # (N,)
+        max_vis_scores, _ = torch.max(asd_probs, dim=-1)
         
         for n in range(N):
             vis_prob = max_vis_scores[n].item()
-            
-            # 🚀 [수정 포인트] 이 청크에 유효한 얼굴 점수가 있는가?
-            # -10.0 로짓은 시그모이드 통과 시 약 0.000045입니다. 
-            # 따라서 0.01보다 작다면 이 청크에서 이 화자는 '완전 실종'된 것으로 간주합니다.
             is_vis_present = vis_prob > 0.01 
+            asd_traj = asd_probs[n] # 이 화자의 2초/3초짜리 ASD 궤적
             
             for k in range(K):
-                # (A) 시각 유사도 (얼굴이 있을 때만 유효)
-                score_vis = vis_prob if is_vis_present else 0.0
+                wav_k = est_sources[k]
                 
-                # (B) 단기 오디오 유사도 (Overlap 파형)
+                # 🚀 [수정됨] 채널별 오디오와 이 화자의 얼굴 궤적 간의 싱크 점수 계산
+                score_vis = 0.0
+                if is_vis_present:
+                    av_corr = self._calc_av_correlation(wav_k, asd_traj)
+                    # 상관계수가 높더라도, 애초에 얼굴 신뢰도(vis_prob)가 낮으면 잡음일 수 있으므로 곱해줌
+                    score_vis = max(0.0, av_corr) * vis_prob 
+                
+                # (B) 단기 오디오 유사도 (Overlap Waveform) -> 정상 작동
                 score_aud_short = 0.0
                 if chunk_idx > 0 and n in self.history and self.history[n]['is_active']:
                     prev_tail = self.history[n]['overlap_wav']
-                    curr_head = est_sources[k, :self.overlap_samples]
-                    # 코사인 유사도 기반 파형 매칭
+                    curr_head = wav_k[:self.overlap_samples]
                     score_aud_short = torch.mean(F.normalize(prev_tail, dim=0) * F.normalize(curr_head, dim=0)).item()
                 
-                # (C) 장기 오디오 유사도 (Golden MFCC Profile)
-                score_aud_long = self.golden_buffer.get_similarity(n, est_sources[k])
+                # (C) 장기 오디오 유사도 (Golden Feature) -> 정상 작동
+                score_aud_long = self.golden_buffer.get_similarity(n, wav_k)
                 
-                # 🚀 [수정된 하이브리드 라우팅]
+                # 동적 라우팅
                 if is_vis_present and vis_prob > 0.8:
-                    # 얼굴이 확실하게 나타나면 비주얼 가이드 우선 (Anchor Reset)
-                    S_total[k, n] = score_vis
-                elif score_aud_short > 0.4: # 임계치를 살짝 낮춰 연속성을 확보
-                    # 얼굴이 없거나 흐릿해도, 방금 전까지 하던 말이 이어지면 오디오 트래킹
+                    S_total[k, n] = score_vis # 이제 각 채널마다 점수가 달라짐!
+                elif score_aud_short > 0.4:
                     S_total[k, n] = score_aud_short
                 else:
-                    # 턴테이킹 후 재등장 등 모든 게 불확실할 때 마지막 보루인 Golden Feature 활용
                     S_total[k, n] = score_aud_long
                     
         row_ind, col_ind = linear_sum_assignment(-S_total.numpy())
