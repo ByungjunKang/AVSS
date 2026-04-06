@@ -91,43 +91,46 @@ class AdvancedHybridMatcher:
         T_chunk = est_sources.shape[-1]
         
         S_total = torch.zeros(K, N)
-        
         asd_probs = torch.sigmoid(asd_scores)
         max_vis_scores, _ = torch.max(asd_probs, dim=-1)
         
         for n in range(N):
             vis_prob = max_vis_scores[n].item()
             is_vis_present = vis_prob > 0.01 
-            asd_traj = asd_probs[n] # 이 화자의 2초/3초짜리 ASD 궤적
             
             for k in range(K):
                 wav_k = est_sources[k]
                 
-                # 🚀 [수정됨] 채널별 오디오와 이 화자의 얼굴 궤적 간의 싱크 점수 계산
+                # (A) 시각 유사도 (Correlation 기반)
                 score_vis = 0.0
                 if is_vis_present:
-                    av_corr = self._calc_av_correlation(wav_k, asd_traj)
-                    # 상관계수가 높더라도, 애초에 얼굴 신뢰도(vis_prob)가 낮으면 잡음일 수 있으므로 곱해줌
-                    score_vis = max(0.0, av_corr) * vis_prob 
+                    score_vis = self._calc_av_correlation(wav_k, asd_probs[n]) * vis_prob
                 
-                # (B) 단기 오디오 유사도 (Overlap Waveform) -> 정상 작동
+                # (B) 🚀 [수정됨] 단기 오디오 유사도 (제대로 된 벡터 내적/코사인 유사도)
                 score_aud_short = 0.0
                 if chunk_idx > 0 and n in self.history and self.history[n]['is_active']:
                     prev_tail = self.history[n]['overlap_wav']
                     curr_head = wav_k[:self.overlap_samples]
-                    score_aud_short = torch.mean(F.normalize(prev_tail, dim=0) * F.normalize(curr_head, dim=0)).item()
+                    
+                    # 수치적 안정성을 위해 F.cosine_similarity 사용 (1D이므로 unsqueeze 필요)
+                    # 결과값은 -1.0 ~ 1.0 사이로 직관적으로 나옵니다.
+                    score_aud_short = F.cosine_similarity(prev_tail.unsqueeze(0), curr_head.unsqueeze(0)).item()
                 
-                # (C) 장기 오디오 유사도 (Golden Feature) -> 정상 작동
+                # (C) 장기 오디오 유사도 (Golden Feature)
                 score_aud_long = self.golden_buffer.get_similarity(n, wav_k)
                 
+                # 🚀 [로깅 추가] 디버깅을 위해 각 점수 출력 (필요 시 주석 해제)
+                # print(f"Chunk {chunk_idx} | T:{n}-C:{k} | V:{score_vis:.3f} S:{score_aud_short:.3f} L:{score_aud_long:.3f}")
+
                 # 동적 라우팅
                 if is_vis_present and vis_prob > 0.8:
-                    S_total[k, n] = score_vis # 이제 각 채널마다 점수가 달라짐!
-                elif score_aud_short > 0.4:
+                    S_total[k, n] = score_vis
+                elif score_aud_short > 0.4: # 이제 정상적인 코사인 유사도 값이므로 0.4~0.7 수준에서 판단 가능
                     S_total[k, n] = score_aud_short
                 else:
                     S_total[k, n] = score_aud_long
                     
+        # Hungarian Matching
         row_ind, col_ind = linear_sum_assignment(-S_total.numpy())
         aligned_sources = torch.zeros((N, T_chunk), dtype=est_sources.dtype, device=est_sources.device)
         
@@ -135,7 +138,12 @@ class AdvancedHybridMatcher:
             aligned_wav = est_sources[r]
             aligned_sources[c] = aligned_wav
             
-            if max_vis_scores[c] > self.golden_vis_thresh and self._calc_rms(aligned_wav) > self.active_rms_thresh:
+            # 🚀 [업데이트 조건 완화] Golden Feature를 더 자주 업데이트하도록 변경
+            # 비전이 아주 확실하거나(0.85), 비전은 좀 약해도 단기 오디오 매칭이 매우 확실할 때(0.9)
+            is_high_conf_vis = max_vis_scores[c] > 0.85
+            is_high_conf_aud = chunk_idx > 0 and n in self.history and score_aud_short > 0.9
+            
+            if (is_high_conf_vis or is_high_conf_aud) and self._calc_rms(aligned_wav) > self.active_rms_thresh:
                 self.golden_buffer.update(c, aligned_wav)
                 
             tail_wav = aligned_wav[-self.overlap_samples:]
@@ -145,6 +153,7 @@ class AdvancedHybridMatcher:
             }
             
         return aligned_sources
+
 
 # -------------------------------------------------------------------------
 # 2. 메인 추론 루프 (Chunking, Filtering, OLA)
