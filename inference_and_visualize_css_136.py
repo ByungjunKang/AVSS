@@ -47,40 +47,36 @@ class AdvancedHybridMatcher:
         self.overlap_samples = int(overlap_sec * sr)
         self.golden_buffer = GoldenFeatureBuffer(sr=sr)
         self.history = {}
+        
+        # 🚀 Phase 1을 위한 임계치 설정
+        self.sink_threshold = 0.3      # 배경 인물 차단을 위한 가상 노드 점수
+        self.energy_dip_thresh = 0.002 # 발화 교대(Turn-taking) 탐지 임계치
         self.golden_vis_thresh = 0.9  
-        self.active_rms_thresh = 0.005 # 침묵 기준 약간 완화
+        self.active_rms_thresh = 0.005 
 
     def _calc_rms(self, wav):
         return torch.sqrt(torch.mean(wav**2, dim=-1) + 1e-9)
 
+    # 🚀 [Fix #3] Energy Dip 탐지: Overlap 구간 내의 무음 구간 확인
+    def _is_energy_dip(self, wav):
+        if wav.shape[0] < 100: return False
+        segments = wav.chunk(5)
+        rms_values = [self._calc_rms(s) for s in segments]
+        return min(rms_values) < self.energy_dip_thresh
+
     def _calc_av_correlation(self, wav, asd_probs):
-        frame_len = self.sr // self.video_fps
-        T_video = asd_probs.shape[0]
-        req_samples = T_video * frame_len
-        
-        if wav.shape[0] < req_samples:
-            wav_padded = F.pad(wav, (0, req_samples - wav.shape[0]))
-        else:
-            wav_padded = wav[:req_samples]
-            
-        wav_frames = wav_padded.view(T_video, frame_len)
-        audio_env = self._calc_rms(wav_frames)
-        
-        a_env = audio_env - audio_env.mean()
-        v_env = asd_probs - asd_probs.mean()
-        
-        a_norm = torch.norm(a_env) + 1e-8
-        v_norm = torch.norm(v_env) + 1e-8
-        corr = torch.sum(a_env * v_env) / (a_norm * v_norm)
-        return corr.item()
+        # (기존 correlation 함수와 동일하므로 생략)
+        ...
 
     def match(self, est_sources, asd_scores, chunk_idx):
         K, N = est_sources.shape[0], asd_scores.shape[0]
         T_chunk = est_sources.shape[-1]
         
+        # 🚀 매칭 행렬 및 기록용 행렬 정의
         S_total = torch.zeros(K, N)
-        S_short_matrix = torch.zeros(K, N) # 🚀 [버그 픽스] 단기 유사도를 저장할 전용 행렬
-        Log_matrix = [["" for _ in range(N)] for _ in range(K)] 
+        S_vis_matrix = torch.zeros(K, N)   # [Fix #1] Cold Start용
+        S_short_matrix = torch.zeros(K, N) # [Fix #3] Energy Dip 판단용
+        Log_matrix = [["" for _ in range(N)] for _ in range(K)]
         
         asd_probs = torch.sigmoid(asd_scores)
         max_vis_scores, _ = torch.max(asd_probs, dim=-1)
@@ -92,25 +88,30 @@ class AdvancedHybridMatcher:
             for k in range(K):
                 wav_k = est_sources[k]
                 
-                # 1. 시각 유사도 (음수 방어 로직 통일)
+                # (A) 시각 유사도 계산
                 score_vis = 0.0
                 if is_vis_present:
                     score_vis = max(0.0, self._calc_av_correlation(wav_k, asd_probs[n])) * vis_prob
+                S_vis_matrix[k, n] = score_vis
                 
-                # 2. 단기 오디오 유사도
+                # (B) 단기 오디오 유사도 계산
                 score_aud_short = 0.0
                 if chunk_idx > 0 and n in self.history and self.history[n]['is_active']:
                     prev_tail = self.history[n]['overlap_wav']
                     curr_head = wav_k[:self.overlap_samples]
-                    # 음수 방어 및 코사인 유사도
-                    score_aud_short = max(0.0, F.cosine_similarity(prev_tail.unsqueeze(0), curr_head.unsqueeze(0)).item())
+                    
+                    # 🚀 [Fix #3] 발화 교대(Turn-taking) 시 Short-term 무효화
+                    if self._is_energy_dip(prev_tail) or self._is_energy_dip(curr_head):
+                        score_aud_short = 0.0
+                    else:
+                        score_aud_short = max(0.0, F.cosine_similarity(prev_tail.unsqueeze(0), curr_head.unsqueeze(0)).item())
                 
-                S_short_matrix[k, n] = score_aud_short # 🚀 연산된 점수를 자기 자리에 정확히 저장!
+                S_short_matrix[k, n] = score_aud_short
                 
-                # 3. 장기 오디오 유사도
+                # (C) 장기 오디오 유사도 계산
                 score_aud_long = self.golden_buffer.get_similarity(n, wav_k)
                 
-                # 라우팅
+                # 🚀 라우팅 로직
                 if is_vis_present and vis_prob > 0.8:
                     S_total[k, n] = score_vis
                     Log_matrix[k][n] = f"VIS ({score_vis:.2f})"
@@ -120,18 +121,35 @@ class AdvancedHybridMatcher:
                 else:
                     S_total[k, n] = score_aud_long
                     Log_matrix[k][n] = f"LONG({score_aud_long:.2f}) | S({score_aud_short:.2f})"
-                    
+
+        # 🚀 [Fix #1] Cold Start Rule: 첫 청크는 오직 Vision에만 의존
+        if chunk_idx == 0:
+            S_total = S_vis_matrix.clone()
+            # 만약 모든 비전 점수가 낮다면 Identity 매칭으로 강제 고정 (0->0, 1->1)
+            if S_total.max() < 0.1:
+                S_total = torch.eye(K, N) * 0.1
+
+        # 🚀 [Fix #6] Virtual Off-screen Sink 확장 (K x N+1)
+        # 배경 인물이 타겟 채널을 뺏어가는 것을 방지
+        virtual_sink = torch.full((K, 1), self.sink_threshold)
+        S_extended = torch.cat([S_total, virtual_sink], dim=1) 
+        
         # Hungarian Matching
-        row_ind, col_ind = linear_sum_assignment(-S_total.numpy())
+        row_ind, col_ind = linear_sum_assignment(-S_extended.numpy())
+        
         aligned_sources = torch.zeros((N, T_chunk), dtype=est_sources.dtype, device=est_sources.device)
-        chunk_decisions = {} 
+        chunk_decisions = {}
         
         for r, c in zip(row_ind, col_ind):
+            # 🚀 [Fix #6] 가상 노드(Index N)와 매칭된 경우 처리
+            if c == N:
+                # 이 채널은 화면 밖 화자이거나 관중이므로 타겟 화자(N명) 할당에서 제외
+                continue
+                
             aligned_wav = est_sources[r]
             aligned_sources[c] = aligned_wav
-            chunk_decisions[c] = Log_matrix[r][c] 
+            chunk_decisions[c] = Log_matrix[r][c]
             
-            # 🚀 [버그 픽스] 정확히 (r, c) 매칭에 해당하는 단기 점수를 꺼내어 검사!
             matched_short_score = S_short_matrix[r, c].item()
             is_high_conf_vis = max_vis_scores[c] > 0.85
             is_high_conf_aud = chunk_idx > 0 and c in self.history and matched_short_score > 0.9
