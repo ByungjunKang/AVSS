@@ -79,7 +79,8 @@ class AdvancedHybridMatcher:
         T_chunk = est_sources.shape[-1]
         
         S_total = torch.zeros(K, N)
-        Log_matrix = [["" for _ in range(N)] for _ in range(K)] # 🚀 로깅 매트릭스
+        S_short_matrix = torch.zeros(K, N) # 🚀 [버그 픽스] 단기 유사도를 저장할 전용 행렬
+        Log_matrix = [["" for _ in range(N)] for _ in range(K)] 
         
         asd_probs = torch.sigmoid(asd_scores)
         max_vis_scores, _ = torch.max(asd_probs, dim=-1)
@@ -91,40 +92,49 @@ class AdvancedHybridMatcher:
             for k in range(K):
                 wav_k = est_sources[k]
                 
+                # 1. 시각 유사도 (음수 방어 로직 통일)
                 score_vis = 0.0
                 if is_vis_present:
                     score_vis = max(0.0, self._calc_av_correlation(wav_k, asd_probs[n])) * vis_prob
                 
+                # 2. 단기 오디오 유사도
                 score_aud_short = 0.0
                 if chunk_idx > 0 and n in self.history and self.history[n]['is_active']:
                     prev_tail = self.history[n]['overlap_wav']
                     curr_head = wav_k[:self.overlap_samples]
+                    # 음수 방어 및 코사인 유사도
                     score_aud_short = max(0.0, F.cosine_similarity(prev_tail.unsqueeze(0), curr_head.unsqueeze(0)).item())
                 
+                S_short_matrix[k, n] = score_aud_short # 🚀 연산된 점수를 자기 자리에 정확히 저장!
+                
+                # 3. 장기 오디오 유사도
                 score_aud_long = self.golden_buffer.get_similarity(n, wav_k)
                 
-                # 🚀 라우팅 및 로그 저장
+                # 라우팅
                 if is_vis_present and vis_prob > 0.8:
                     S_total[k, n] = score_vis
                     Log_matrix[k][n] = f"VIS ({score_vis:.2f})"
                 elif score_aud_short > 0.4:
                     S_total[k, n] = score_aud_short
-                    Log_matrix[k][n] = f"SHORT ({score_aud_short:.2f})"
+                    Log_matrix[k][n] = f"SHORT({score_aud_short:.2f}) | L({score_aud_long:.2f})"
                 else:
                     S_total[k, n] = score_aud_long
-                    Log_matrix[k][n] = f"LONG ({score_aud_long:.2f})"
+                    Log_matrix[k][n] = f"LONG({score_aud_long:.2f}) | S({score_aud_short:.2f})"
                     
+        # Hungarian Matching
         row_ind, col_ind = linear_sum_assignment(-S_total.numpy())
         aligned_sources = torch.zeros((N, T_chunk), dtype=est_sources.dtype, device=est_sources.device)
-        chunk_decisions = {} # {track_id: log_string}
+        chunk_decisions = {} 
         
         for r, c in zip(row_ind, col_ind):
             aligned_wav = est_sources[r]
             aligned_sources[c] = aligned_wav
-            chunk_decisions[c] = Log_matrix[r][c] # 결정된 로그 저장
+            chunk_decisions[c] = Log_matrix[r][c] 
             
+            # 🚀 [버그 픽스] 정확히 (r, c) 매칭에 해당하는 단기 점수를 꺼내어 검사!
+            matched_short_score = S_short_matrix[r, c].item()
             is_high_conf_vis = max_vis_scores[c] > 0.85
-            is_high_conf_aud = chunk_idx > 0 and c in self.history and score_aud_short > 0.9
+            is_high_conf_aud = chunk_idx > 0 and c in self.history and matched_short_score > 0.9
             
             if (is_high_conf_vis or is_high_conf_aud) and self._calc_rms(aligned_wav) > self.active_rms_thresh:
                 self.golden_buffer.update(c, aligned_wav)
