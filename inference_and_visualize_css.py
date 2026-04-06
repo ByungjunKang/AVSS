@@ -262,7 +262,7 @@ def main():
     chunk_samples = int(chunk_sec * sr)
     stride_samples = int((chunk_sec - overlap_sec) * sr)
     chunk_frames = int(chunk_sec * fps)
-    stride_frames = int((chunk_sec - overlap_sec) * fps)
+    # stride_frames = int((chunk_sec - overlap_sec) * fps)
 
     video_files = glob.glob(os.path.join(args.video_dir, "*.mp4"))
     
@@ -313,7 +313,8 @@ def main():
             for chunk_idx in range(num_chunks):
                 start_samp = chunk_idx * stride_samples
                 end_samp = start_samp + chunk_samples
-                start_frame = chunk_idx * stride_frames
+                
+                start_frame = int(round((start_samp / sr) * fps))
                 end_frame = start_frame + chunk_frames
                 
                 # 🚀 [수정됨] break 대신 Padding 수행
