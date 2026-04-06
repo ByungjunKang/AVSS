@@ -316,10 +316,26 @@ def main():
                 start_frame = chunk_idx * stride_frames
                 end_frame = start_frame + chunk_frames
                 
-                if end_samp > total_samples: break 
+                # 🚀 [수정됨] break 대신 Padding 수행
+                # if end_samp > total_samples: break (이 줄 삭제)
 
-                mix_chunk = wav[start_samp:end_samp].unsqueeze(0).unsqueeze(0).to(device)
-                asd_chunk = asd_matrix[:, start_frame:end_frame]
+                # 오디오 패딩 준비
+                if end_samp > total_samples:
+                    actual_wav = wav[start_samp:total_samples]
+                    pad_len = end_samp - total_samples
+                    mix_chunk = F.pad(actual_wav, (0, pad_len)).unsqueeze(0).unsqueeze(0).to(device)
+                else:
+                    mix_chunk = wav[start_samp:end_samp].unsqueeze(0).unsqueeze(0).to(device)
+                
+                # 비디오(ASD) 패딩 준비
+                if end_frame > max_video_len:
+                    actual_asd = asd_matrix[:, start_frame:max_video_len]
+                    pad_len_frames = end_frame - max_video_len
+                    # 얼굴이 없는 상태(-10.0)로 패딩
+                    pad_asd = torch.full((len(valid_tracks), pad_len_frames), -10.0)
+                    asd_chunk = torch.cat([actual_asd, pad_asd], dim=-1)
+                else:
+                    asd_chunk = asd_matrix[:, start_frame:end_frame]
                 
                 raw_est_sources = model(mix_chunk).squeeze(0).cpu()
                 speech_sources = raw_est_sources[:2, :] 
