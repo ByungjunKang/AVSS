@@ -129,36 +129,54 @@ class SeamlessSilentTalkSystem:
         return np.array(cropped_lips) # 최종 형태: (T, 96, 96)
 
     def extract_text_from_lips(self, lip_frames):
-        """torchvision 전처리기를 배제하고 수동으로 차원을 제어하여 에러 완벽 회피"""
+        """숨겨진 차원을 완벽히 제거하고 텍스트 디코딩을 수행하는 최종 버전"""
         print("3. VSR 텍스트 디코딩 수행 중...")
         
-        # 1. 현재 lip_frames는 (T, 96, 96) 형태의 Numpy 배열입니다.
-        # Auto-AVSR 모델은 88x88 크기를 요구하므로 수동으로 CenterCrop(가장자리 4픽셀씩 제거)
+        # 1. 차원 평탄화 (에러 해결의 핵심!)
+        # (T, 96, 96, 1)이든 뭐든 끝에 붙은 찌꺼기를 날려버리고 완벽한 (T, 96, 96)으로 강제 변환합니다.
+        lip_frames = np.squeeze(lip_frames)
+        
+        # 만약 프레임이 1개라서 (96, 96)이 되었다면 (1, 96, 96)으로 시간 차원 복구
+        if lip_frames.ndim == 2:
+            lip_frames = np.expand_dims(lip_frames, axis=0)
+            
+        # 2. 88x88 Center Crop
         lip_crop = lip_frames[:, 4:92, 4:92] # Shape: (T, 88, 88)
         
-        # 2. PyTorch Tensor로 변환 및 [0, 1] 스케일링
+        # 3. 텐서 변환 및 스케일링
         video_tensor = torch.tensor(lip_crop).float() / 255.0
         
-        # 3. Grayscale 정규화 (Auto-AVSR 논문의 공식 평균/표준편차 적용)
+        # 4. Grayscale 정규화
         video_tensor = (video_tensor - 0.421) / 0.165
         
-        # 4. 모델이 요구하는 정확한 5차원(B, C, T, H, W) 생성
-        # 현재 (T, 88, 88) 차원의 맨 앞에 배치(B=1)와 채널(C=1) 차원을 2개 추가합니다.
-        video_tensor = video_tensor.unsqueeze(0).unsqueeze(0) 
-        # 최종 Shape 보장: (1, 1, T, 88, 88)
-        
+        # 5. 차원 강제 맞춤: 배치(1)와 채널(1) 추가
+        # 이제 완벽하고 깔끔한 5차원 (1, 1, T, 88, 88)이 완성됩니다!
+        video_tensor = video_tensor.unsqueeze(0).unsqueeze(0)
         video_tensor = video_tensor.to(self.device)
         
-        # 5. 시퀀스 길이 정보 생성
-        # video_lengths = torch.tensor([video_tensor.size(2)]).to(self.device)
+        # (디버깅) 콘솔창에서 이 모양이 정확히 숫자 5개인지 확인해보세요!
+        print(f"   - 입력 텐서 최종 Shape: {video_tensor.shape}")
         
         # 6. 모델 추론
         with torch.no_grad():
-            transcript = self.vsr_model(video_tensor)
-                    
-        # 결과물이 리스트나 튜플로 나올 경우 텍스트만 깔끔하게 추출
+            try:
+                # 방법 A: ESPnet 공식 텍스트 디코딩 메서드 호출 (가장 정확함)
+                # recognize 내부에 들어가면서 자동으로 배치가 풀리고 계산되므로 언패킹 에러가 안 납니다.
+                # video_tensor[0]은 (1, T, 88, 88) 형태 (C, T, H, W)가 됩니다.
+                transcript = self.vsr_model.model.recognize(video_tensor[0])
+            except Exception as e:
+                print(f"   - (참고) 기본 디코딩 실패, 대체 로직 실행: {e}")
+                # 방법 B: Lightning 모듈에 딕셔너리로 길이를 함께 명시해서 넘기기
+                video_lengths = torch.tensor([video_tensor.size(2)]).to(self.device)
+                transcript = self.vsr_model(video=video_tensor, video_lengths=video_lengths)
+                
+        # 7. 결과물 정제 (튜플이나 리스트일 경우 텍스트만 추출)
         if isinstance(transcript, list) or isinstance(transcript, tuple):
             transcript = transcript[0]
+            
+        # ESPnet은 종종 딕셔너리로 결과를 줍니다. 텍스트만 쏙 빼냅니다.
+        if isinstance(transcript, dict) and "text" in transcript:
+            transcript = transcript["text"]
             
         print(f"   - VSR 결과: '{transcript}'")
         return transcript
