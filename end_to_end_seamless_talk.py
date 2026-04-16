@@ -73,8 +73,8 @@ class SeamlessSilentTalkSystem:
         print("초기화 완료.\n")
 
     def extract_lips_from_video(self, video_path):
-        """MediaPipe를 이용해 영상에서 입술만 96x96 Grayscale로 크롭"""
-        print(f"2. 비디오 전처리 중: {video_path}")
+        """면적이 가장 큰 타겟 화자의 입술만 96x96으로 크롭 (차원 수정)"""
+        print(f"2. 비디오 전처리 중: {video_path} (가장 큰 얼굴 추적)")
         cap = cv2.VideoCapture(video_path)
         cropped_lips = []
         
@@ -87,10 +87,22 @@ class SeamlessSilentTalkSystem:
             results = self.mp_face_mesh.process(rgb_frame)
             
             if results.multi_face_landmarks:
-                landmarks = results.multi_face_landmarks[0].landmark
                 h, w, _ = frame.shape
                 
-                # 입술 랜드마크 추출 (61, 291: 입꼬리 / 0, 17: 위아래 입술)
+                target_landmarks = None
+                max_area = 0
+                
+                for face_landmarks in results.multi_face_landmarks:
+                    x_coords_all = [l.x for l in face_landmarks.landmark]
+                    y_coords_all = [l.y for l in face_landmarks.landmark]
+                    face_area = (max(x_coords_all) - min(x_coords_all)) * (max(y_coords_all) - min(y_coords_all))
+                    
+                    if face_area > max_area:
+                        max_area = face_area
+                        target_landmarks = face_landmarks.landmark
+                
+                landmarks = target_landmarks
+                
                 x_coords = [int(l.x * w) for i, l in enumerate(landmarks) if i in [61, 291, 0, 17]]
                 y_coords = [int(l.y * h) for i, l in enumerate(landmarks) if i in [61, 291, 0, 17]]
                 
@@ -99,33 +111,48 @@ class SeamlessSilentTalkSystem:
                 y_min, y_max = max(0, min(y_coords)-margin), min(h, max(y_coords)+margin)
                 
                 lip_crop = frame[y_min:y_max, x_min:x_max]
-                lip_crop_resized = cv2.resize(lip_crop, (96, 96))
                 
-                # Auto-AVSR 학습 데이터 기준에 맞추기 위해 흑백(Grayscale) 변환
+                if lip_crop.size == 0:
+                    cropped_lips.append(np.zeros((96, 96), dtype=np.uint8))
+                    continue
+                    
+                lip_crop_resized = cv2.resize(lip_crop, (96, 96))
                 lip_gray = cv2.cvtColor(lip_crop_resized, cv2.COLOR_BGR2GRAY)
-                lip_gray = np.expand_dims(lip_gray, axis=-1) # (96, 96, 1)로 맞춤
+                
+                # [수정포인트] 차원 확장(expand_dims)을 제거하고 순수 (96, 96) 2D 이미지로 저장
                 cropped_lips.append(lip_gray)
             else:
-                # 얼굴을 놓쳤을 경우 검은색 빈 프레임으로 채움 (시간 동기화 유지)
-                cropped_lips.append(np.zeros((96, 96, 1), dtype=np.uint8))
+                cropped_lips.append(np.zeros((96, 96), dtype=np.uint8))
                 
         cap.release()
-        print(f"   - 총 {len(cropped_lips)} 프레임 추출 완료.")
-        return np.array(cropped_lips) # (T, 96, 96, 1)
+        print(f"   - 총 {len(cropped_lips)} 프레임 입술 추출 완료.")
+        return np.array(cropped_lips) # 최종 형태: (T, 96, 96)
 
     def extract_text_from_lips(self, lip_frames):
-        """Auto-AVSR 모델을 통과시켜 텍스트 추론"""
+        """Auto-AVSR 모델을 통과시켜 텍스트 추론 (5D 텐서 수정)"""
         print("3. VSR 텍스트 디코딩 수행 중...")
         
-        # 모델 입력 형태로 텐서 변환: (T, H, W, C) -> (T, C, H, W)
-        video_tensor = torch.tensor(lip_frames).float().permute(0, 3, 1, 2)
-        video_tensor = self.video_transform(video_tensor).unsqueeze(0).to(self.device) # 배치 차원 추가
+        # 1. VideoTransform 적용: (T, 96, 96) 형태를 받아 (C, T, 96, 96) 텐서로 자동 변환해 줍니다.
+        # 여기서 C(채널)는 흑백이므로 1이 됩니다.
+        video_tensor = self.video_transform(lip_frames)
         
+        # 2. 배치(Batch) 차원 맨 앞에 추가 -> (1, 1, T, 96, 96) (정확한 5차원 완성)
+        video_tensor = video_tensor.unsqueeze(0).to(self.device)
+        
+        # 3. 모델 추론을 위한 시퀀스 길이 생성 (ESPnet 구조상 필수 입력값)
+        video_lengths = torch.tensor([video_tensor.size(2)]).to(self.device)
+        
+        # 4. 모델 추론
         with torch.no_grad():
-            transcript = self.vsr_model(video_tensor)
+            try:
+                # 일반적인 입력 방식 (입력 텐서 + 길이)
+                transcript = self.vsr_model(video_tensor, video_lengths)
+            except Exception as e:
+                # 혹시 길이가 필요 없는 래퍼(Wrapper) 구조일 경우를 위한 예외 처리
+                transcript = self.vsr_model(video_tensor)
             
-        # 리스트로 반환될 경우 첫 번째 요소 추출
-        if isinstance(transcript, list):
+        # 결과물이 리스트나 튜플로 나올 경우 첫 번째 텍스트만 추출
+        if isinstance(transcript, list) or isinstance(transcript, tuple):
             transcript = transcript[0]
             
         print(f"   - VSR 결과: '{transcript}'")
