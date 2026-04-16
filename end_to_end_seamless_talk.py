@@ -7,7 +7,12 @@ import numpy as np
 import mediapipe as mp
 import librosa
 import soundfile as sf
-from TTS.api import TTS
+# 기존 TTS import 주석 처리 또는 삭제
+# from TTS.api import TTS 
+
+# 로컬 로딩을 위한 XTTS Core API 임포트
+from TTS.tts.configs.xtts_config import XttsConfig
+from TTS.tts.models.xtts import Xtts
 
 # ----------------------------------------------------
 # Auto-AVSR 공식 모듈 임포트 (auto_avsr 최상단 폴더에서 실행 필수)
@@ -50,10 +55,21 @@ class SeamlessSilentTalkSystem:
             static_image_mode=False, max_num_faces=1, min_detection_confidence=0.5)
         
         # ==========================================
-        # 3. XTTS 모델 로드 (개인화 음성 합성용)
+        # 3. XTTS 모델 로드 (완전 오프라인 로컬 방식)
         # ==========================================
-        print("   - XTTS-v2 모델 로드 (시간이 약간 소요될 수 있습니다)")
-        self.tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(self.device)
+        print("   - XTTS-v2 로컬 모델 로드 중 (사내망 모드)...")
+        
+        # 아까 만든 로컬 폴더 경로 지정
+        local_model_path = "./xtts_local_model" 
+        
+        # 설정 파일 로드
+        self.xtts_config = XttsConfig()
+        self.xtts_config.load_json(os.path.join(local_model_path, "config.json"))
+        
+        # 빈 모델 껍데기 생성 후 가중치 덮어씌우기
+        self.tts = Xtts.init_from_config(self.xtts_config)
+        self.tts.load_checkpoint(self.xtts_config, checkpoint_dir=local_model_path, eval=True)
+        self.tts.to(self.device)
         print("초기화 완료.\n")
 
     def extract_lips_from_video(self, video_path):
@@ -118,16 +134,23 @@ class SeamlessSilentTalkSystem:
     def generate_personalized_ssi(self, text, reference_audio_path):
         """XTTS를 이용해 Y_audio의 음색을 복제한 합성음(Y_ssi) 생성"""
         print(f"4. 개인화 TTS 합성 중 (원본 음색 복제)...")
-        output_path = "temp_y_ssi.wav"
         
-        # XTTS: 분리된 오디오(reference)의 화자 특성을 뽑아내어 텍스트를 합성
-        self.tts.tts_to_file(text=text, 
-                             speaker_wav=reference_audio_path, 
-                             language="en", 
-                             file_path=output_path)
+        # XTTS Core API를 사용하여 메모리 내에서 직접 오디오 생성
+        outputs = self.tts.synthesize(
+            text,
+            self.xtts_config,
+            speaker_wav=reference_audio_path,
+            gpt_cond_len=3,
+            language="en" # 한국어 테스트 시 "ko"로 변경
+        )
         
-        y_ssi, sr = librosa.load(output_path, sr=16000)
-        return y_ssi
+        # XTTS의 기본 출력 샘플링 레이트는 24000Hz 입니다.
+        y_ssi_24k = np.array(outputs["wav"])
+        
+        # 전체 시스템 파이프라인 동기화(16000Hz)를 위해 리샘플링 수행
+        y_ssi_16k = librosa.resample(y_ssi_24k, orig_sr=24000, target_sr=16000)
+        
+        return y_ssi_16k
 
     def run_pipeline(self, raw_video_path, separated_audio_path, output_mixed_path):
         """전체 통합 파이프라인 실행"""
