@@ -150,19 +150,11 @@ class SeamlessSilentTalkSystem:
         video_tensor = video_tensor.to(self.device)
         
         # 5. 시퀀스 길이 정보 생성
-        video_lengths = torch.tensor([video_tensor.size(2)]).to(self.device)
+        # video_lengths = torch.tensor([video_tensor.size(2)]).to(self.device)
         
         # 6. 모델 추론
         with torch.no_grad():
-            try:
-                # 완벽한 5차원 텐서가 들어가므로 xs_pad.size() 언패킹 에러가 사라집니다.
-                transcript = self.vsr_model(video_tensor, video_lengths)
-            except Exception as e:
-                # 만약 PyTorch Lightning 래퍼 내부에서 충돌이 날 경우를 대비한 직접 디코딩 호출
-                if hasattr(self.vsr_model, "model") and hasattr(self.vsr_model.model, "recognize"):
-                    transcript = self.vsr_model.model.recognize(video_tensor[0, 0])
-                else:
-                    raise e
+            transcript = self.vsr_model(video_tensor)
                     
         # 결과물이 리스트나 튜플로 나올 경우 텍스트만 깔끔하게 추출
         if isinstance(transcript, list) or isinstance(transcript, tuple):
