@@ -129,29 +129,42 @@ class SeamlessSilentTalkSystem:
         return np.array(cropped_lips) # 최종 형태: (T, 96, 96)
 
     def extract_text_from_lips(self, lip_frames):
-        """Auto-AVSR 모델을 통과시켜 텍스트 추론 (5D 텐서 수정)"""
+        """torchvision 전처리기를 배제하고 수동으로 차원을 제어하여 에러 완벽 회피"""
         print("3. VSR 텍스트 디코딩 수행 중...")
         
-        # 1. VideoTransform 적용: (T, 96, 96) 형태를 받아 (C, T, 96, 96) 텐서로 자동 변환해 줍니다.
-        # 여기서 C(채널)는 흑백이므로 1이 됩니다.
-        video_tensor = self.video_transform(lip_frames)
+        # 1. 현재 lip_frames는 (T, 96, 96) 형태의 Numpy 배열입니다.
+        # Auto-AVSR 모델은 88x88 크기를 요구하므로 수동으로 CenterCrop(가장자리 4픽셀씩 제거)
+        lip_crop = lip_frames[:, 4:92, 4:92] # Shape: (T, 88, 88)
         
-        # 2. 배치(Batch) 차원 맨 앞에 추가 -> (1, 1, T, 96, 96) (정확한 5차원 완성)
-        video_tensor = video_tensor.unsqueeze(0).to(self.device)
+        # 2. PyTorch Tensor로 변환 및 [0, 1] 스케일링
+        video_tensor = torch.tensor(lip_crop).float() / 255.0
         
-        # 3. 모델 추론을 위한 시퀀스 길이 생성 (ESPnet 구조상 필수 입력값)
+        # 3. Grayscale 정규화 (Auto-AVSR 논문의 공식 평균/표준편차 적용)
+        video_tensor = (video_tensor - 0.421) / 0.165
+        
+        # 4. 모델이 요구하는 정확한 5차원(B, C, T, H, W) 생성
+        # 현재 (T, 88, 88) 차원의 맨 앞에 배치(B=1)와 채널(C=1) 차원을 2개 추가합니다.
+        video_tensor = video_tensor.unsqueeze(0).unsqueeze(0) 
+        # 최종 Shape 보장: (1, 1, T, 88, 88)
+        
+        video_tensor = video_tensor.to(self.device)
+        
+        # 5. 시퀀스 길이 정보 생성
         video_lengths = torch.tensor([video_tensor.size(2)]).to(self.device)
         
-        # 4. 모델 추론
+        # 6. 모델 추론
         with torch.no_grad():
             try:
-                # 일반적인 입력 방식 (입력 텐서 + 길이)
+                # 완벽한 5차원 텐서가 들어가므로 xs_pad.size() 언패킹 에러가 사라집니다.
                 transcript = self.vsr_model(video_tensor, video_lengths)
             except Exception as e:
-                # 혹시 길이가 필요 없는 래퍼(Wrapper) 구조일 경우를 위한 예외 처리
-                transcript = self.vsr_model(video_tensor)
-            
-        # 결과물이 리스트나 튜플로 나올 경우 첫 번째 텍스트만 추출
+                # 만약 PyTorch Lightning 래퍼 내부에서 충돌이 날 경우를 대비한 직접 디코딩 호출
+                if hasattr(self.vsr_model, "model") and hasattr(self.vsr_model.model, "recognize"):
+                    transcript = self.vsr_model.model.recognize(video_tensor[0, 0])
+                else:
+                    raise e
+                    
+        # 결과물이 리스트나 튜플로 나올 경우 텍스트만 깔끔하게 추출
         if isinstance(transcript, list) or isinstance(transcript, tuple):
             transcript = transcript[0]
             
