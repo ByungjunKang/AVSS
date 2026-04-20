@@ -130,33 +130,41 @@ class VpuSyncedLrs3PoC:
         print(f"4. Duration Control 합성 진행 (Zero-shot)")
         
         if self.tts_model is None:
-            # TTS 미설치 시 1초짜리 빈 오디오 반환 (디버깅용)
             return np.zeros(16000)
 
-        # 1. 모델이 예측한 기본 발화 길이(T_pred)를 알아내기 위한 베이스라인 추론
-        # (원래는 모델 내부 텐서 길이를 직접 가져와야 하지만, PoC 레벨에서는 기본 합성본의 길이로 T_pred를 정의합니다.)
         prompt_speech_16k = load_wav(ref_audio_path, 16000)
-        baseline_output = self.tts_model.inference_zero_shot(text, "영어", prompt_speech_16k, prompt_text="")
         
-        # 기본 합성된 파형의 길이를 T_pred로 삼음
+        # ==========================================
+        # 수정 1: "영어" 제거 및 키워드 인자 명시
+        # 수정 2: CosyVoice는 Generator를 반환하므로 next()로 첫 번째 결과를 뽑아냄
+        # ==========================================
+        generator_base = self.tts_model.inference_zero_shot(
+            tts_text=text, 
+            prompt_text="", 
+            prompt_speech_16k=prompt_speech_16k
+        )
+        baseline_output = next(generator_base)
+        
         y_baseline = baseline_output['tts_speech'].numpy().flatten()
-        t_pred = len(y_baseline) / 22050.0 # CosyVoice 기본 sample rate
+        t_pred = len(y_baseline) / 22050.0 
         
-        # ==========================================
         # ★ [특허 수식 적용] 감마(Gamma) 산출 및 Duration 강제 조절
-        # ==========================================
         gamma = t_vpu_target / t_pred
-        
-        # 모델의 speed 파라미터는 보통 감마의 역수로 작용 (속도가 빠르면 길이가 짧아짐)
         speed_factor = 1.0 / gamma 
         
         print(f"   - T_pred(모델기본): {t_pred:.2f}s | T_vpu(목표): {t_vpu_target:.2f}s")
         print(f"   - γ(Gamma): {gamma:.2f} | 적용 Speed Factor: {speed_factor:.2f}")
 
         # 스케일링(Speed)이 적용된 최종 합성
-        synced_output = self.tts_model.inference_zero_shot(
-            text, "영어", prompt_speech_16k, prompt_text="", speed=speed_factor
+        generator_synced = self.tts_model.inference_zero_shot(
+            tts_text=text, 
+            prompt_text="", 
+            prompt_speech_16k=prompt_speech_16k, 
+            stream=False,
+            speed=speed_factor
         )
+        synced_output = next(generator_synced)
+        
         y_ssi_22k = synced_output['tts_speech'].numpy().flatten()
         
         # 파이프라인 동기화를 위해 16kHz로 리샘플링
