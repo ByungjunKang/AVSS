@@ -109,20 +109,33 @@ class VpuSyncedLrs3PoC:
         print(f"   - VSR 결과: '{transcript}'")
         return transcript
 
-    def get_vpu_proxy_anchor(self, clean_audio_path):
-        """[특허 검증 1] LRS3 정답 오디오에서 VPU 앵커 (T_vpu) 추출"""
+    def get_vpu_proxy_anchor(self, clean_audio_path, max_duration=None):
+        """[특허 검증 1] LRS3 정답 오디오에서 VPU 앵커 (T_vpu) 추출
+           (비디오 길이에 맞춰 오디오 초반부만 분석하여 타겟 텍스트와의 매핑 오류 방지)"""
         y, sr = librosa.load(clean_audio_path, sr=16000)
-        # VPU 가속도계가 감지하는 성대 진동과 유사하게 에너지 기반 발화 구간 추출
-        intervals = librosa.effects.split(y, top_db=25) 
+        
+        # ★ 비디오 물리 앵커 길이(max_duration)가 주어지면 해당 구간까지만 잘라서 분석
+        if max_duration is not None:
+            max_samples = int(max_duration * sr)
+            if len(y) > max_samples:
+                y_analyze = y[:max_samples]
+            else:
+                y_analyze = y
+        else:
+            y_analyze = y
+            
+        # 잘라낸 초반부 오디오에서만 실제 발화(에너지) 구간 탐색
+        intervals = librosa.effects.split(y_analyze, top_db=25) 
         if len(intervals) > 0:
             t_start = intervals[0][0] / sr
             t_end = intervals[-1][1] / sr
             t_vpu = t_end - t_start
         else:
-            t_start, t_end = 0, len(y) / sr
+            t_start, t_end = 0, len(y_analyze) / sr
             t_vpu = t_end
             
-        print(f"3. VPU 프록시 앵커 획득: T_start={t_start:.2f}s, T_end={t_end:.2f}s, T_vpu(발화길이)={t_vpu:.2f}s")
+        print(f"3. VPU 프록시 앵커 획득: 분석 길이 {len(y_analyze)/sr:.2f}s 제한")
+        print(f"   - T_start={t_start:.2f}s, T_end={t_end:.2f}s, T_vpu(순수 발화)={t_vpu:.2f}s")
         return t_start, t_end, t_vpu
 
     def generate_synced_ssi(self, text, ref_audio_path, t_vpu_target):
@@ -198,14 +211,22 @@ class VpuSyncedLrs3PoC:
         print("LRS3 벤치마크 기반 VPU-TTS 동기화 검증 PoC")
         print("========================================")
         
-        # 1. 텍스트 추출
+        # 1. 텍스트 추출 
         lip_frames = self.extract_lips_from_face_crop(lrs3_video_path)
         text = self.extract_text_from_lips(lip_frames)
         
-        # 2. VPU Proxy 앵커 획득
-        t_start, t_end, t_vpu = self.get_vpu_proxy_anchor(lrs3_clean_audio_path)
+        # ★ LRS3 데이터셋 기준 25 fps로 비디오의 물리적 길이 계산
+        video_duration = len(lip_frames) / 25.0
+        print(f"   - 입력 비디오 길이: {video_duration:.2f}s")
+        
+        # 2. VPU Proxy 앵커 획득 (비디오 길이에 해당하는 초반 오디오만 분석!)
+        t_start, t_end, t_vpu = self.get_vpu_proxy_anchor(
+            lrs3_clean_audio_path, 
+            max_duration=video_duration
+        )
         
         # 3. 음색 복제 및 Duration 제어
+        # 주의: separated_audio_path는 자르지 않고 전체 파일을 넘겨주어 음색 복제 퀄리티를 유지합니다!
         y_ssi = self.generate_synced_ssi(text, separated_audio_path, t_vpu)
         
         # 4. 믹싱
