@@ -517,11 +517,24 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     
     print("⏳ [Init] Loading Models (S3FD, LR-ASD, TIGER)...")
-    # Load ASD Models
-    DET = S3FD(device='cuda')
-    ASD_model = ASD()
-    ASD_model.loadParameters(args.asd_weight)
-    ASD_model.eval()
+    
+    # 🚀 [추가된 부분] 원래 작업 폴더 기억하기
+    original_cwd = os.getcwd()
+    
+    try:
+        # 잠시 LR-ASD 폴더로 작업 디렉토리 이동 (위에서 정의한 LR_ASD_DIR 변수 사용)
+        os.chdir(LR_ASD_DIR) 
+        
+        # 이제 상대 경로로 하드코딩된 S3FD와 ASD 모델이 정상적으로 파일을 찾습니다.
+        DET = S3FD(device='cuda')
+        ASD_model = ASD()
+        # 주의: args.asd_weight가 상대 경로라면, 여기서 에러가 날 수 있으므로 절대 경로로 넘겨주는 것이 좋습니다.
+        ASD_model.loadParameters(args.asd_weight) 
+        ASD_model.eval()
+        
+    finally:
+        # 🚀 모델 로딩이 끝나면 무조건 원래 TIGER 폴더로 복귀
+        os.chdir(original_cwd)
 
     # Load TIGER
     import look2hear.models
