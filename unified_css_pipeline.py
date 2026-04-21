@@ -111,6 +111,23 @@ class RobustGoldenFeatureBuffer:
         prof_b = self.golden_profiles[track_id].unsqueeze(0)
         return max(0.0, F.cosine_similarity(prof_a, prof_b).item())
 
+    # 기존 get_similarity와 update가 내부에서 임베딩을 직접 뽑지 않고, 
+    # 미리 계산된 임베딩을 인자로 받도록 수정합니다.
+    def get_similarity_with_embed(self, track_id, current_profile):
+        if track_id not in self.golden_profiles:
+            return 0.0
+        prof_a = current_profile.unsqueeze(0)
+        prof_b = self.golden_profiles[track_id].unsqueeze(0)
+        return max(0.0, F.cosine_similarity(prof_a, prof_b).item())
+
+    def update_with_embed(self, track_id, new_profile, is_strict_vis=False, is_high_conf_vis=False):
+        # 🚀 내부에서 _get_vocal_profile를 호출하지 않고 전달받은 new_profile 사용
+        is_empty = track_id not in self.golden_profiles
+        if is_strict_vis or (is_empty and is_high_conf_vis):
+            self._apply_ema_update(track_id, new_profile)
+            self.candidate_queues[track_id] = []
+            return
+
 class AdvancedHybridMatcher:
     def __init__(self, sr=16000, video_fps=25):
         self.sr = sr
@@ -137,6 +154,12 @@ class AdvancedHybridMatcher:
         K, N = est_sources.shape[0], asd_scores.shape[0]
         T_chunk = est_sources.shape[-1]
         
+        # 🚀 [Optimization] 매칭 시작 전, K개 채널에 대한 임베딩을 '딱 한 번씩만' 추출
+        # 이 과정이 실제 NPU가 부담해야 할 순수 추론 횟수(K회)가 됩니다.
+        channel_embeddings = []
+        for k in range(K):
+            channel_embeddings.append(self.golden_buffer._get_vocal_profile(est_sources[k]))
+            
         S_total = torch.zeros(K, N)
         Log_matrix = [["" for _ in range(N)] for _ in range(K)]
         
@@ -145,14 +168,14 @@ class AdvancedHybridMatcher:
         
         for n in range(N):
             vis_prob = max_vis_scores[n].item()
-            is_vis_present = vis_prob > 0.01 
             has_profile = self.golden_buffer.has_profile(n)
 
             for k in range(K):
-                wav_k = est_sources[k]
-                score_vis = max(0.0, self._calc_av_correlation(wav_k, asd_probs[n])) * vis_prob if is_vis_present else 0.0
-                score_aud_long = self.golden_buffer.get_similarity(n, wav_k)
-                
+                # 미리 뽑아둔 임베딩 재사용 (중복 연산 제거)
+                current_embed = channel_embeddings[k]
+                score_vis = max(0.0, self._calc_av_correlation(est_sources[k], asd_probs[n])) * vis_prob
+                score_aud_long = self.golden_buffer.get_similarity_with_embed(n, current_embed)
+        
                 if vis_prob > 0.8:
                     if has_profile:
                         fused_score = (score_vis + score_aud_long) / 2.0
@@ -174,17 +197,26 @@ class AdvancedHybridMatcher:
             matched_score = S_total[r, c].item()
             routing_reason = Log_matrix[r][c]
             
+            # 1. 🚀 최종 채널 할당 및 로깅 (삭제되면 안 되는 필수 로직)
             aligned_wav = est_sources[r]
             aligned_sources[c] = aligned_wav
             chunk_decisions[c] = routing_reason
             
+            # 2. 🚀 업데이트 자격 심사 (조건문 유지)
             vis_prob_for_c = max_vis_scores[c].item()
             is_strict_vis = vis_prob_for_c > 0.95
             is_high_conf_vis = vis_prob_for_c > 0.85
             is_high_conf_long = routing_reason.startswith("LONG") and matched_score > 0.85
             
+            # 3. 🚀 최적화된 버퍼 업데이트 (Pre-extracted 임베딩 재사용)
             if (is_high_conf_vis or is_high_conf_long) and self._calc_rms(aligned_wav) > self.active_rms_thresh:
-                self.golden_buffer.update(c, aligned_wav, is_strict_vis=is_strict_vis, is_high_conf_vis=is_high_conf_vis)
+                # aligned_wav를 다시 인코딩하지 않고, 매칭 전 뽑아둔 'channel_embeddings[r]'을 바로 삽입!
+                self.golden_buffer.update_with_embed(
+                    track_id=c, 
+                    new_profile=channel_embeddings[r], 
+                    is_strict_vis=is_strict_vis, 
+                    is_high_conf_vis=is_high_conf_vis
+                )
             
         return aligned_sources, chunk_decisions
 
