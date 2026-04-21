@@ -368,27 +368,40 @@ def process_single_video(video_path, output_dir, DET, ASD_model):
         os.makedirs(args.pyframesPath, exist_ok = True) 
         os.makedirs(args.pycropPath, exist_ok = True) 
         
-        # 1. 미디어 추출
+        timings = {} # 🚀 시간 측정을 담을 딕셔너리
+        
+        # ⏱️ 1. Media Extraction (FFmpeg)
+        t0 = time.perf_counter()
         subprocess.call(f"ffmpeg -y -i {args.videoPath} -qscale:v 2 -threads {args.nDataLoaderThread} -async 1 -r 25 {args.videoFilePath} -loglevel panic", shell=True)
         subprocess.call(f"ffmpeg -y -i {args.videoFilePath} -qscale:a 0 -ac 1 -vn -threads {args.nDataLoaderThread} -ar 16000 {args.audioFilePath} -loglevel panic", shell=True)
         subprocess.call(f"ffmpeg -y -i {args.videoFilePath} -qscale:v 2 -threads {args.nDataLoaderThread} -f image2 {os.path.join(args.pyframesPath, '%06d.jpg')} -loglevel panic", shell=True)
+        timings['media'] = time.perf_counter() - t0
         
-        # 2. 탐지 및 추적
+        # ⏱️ 2. Scene Detection
+        t0 = time.perf_counter()
         scene = scene_detect(args)
-        faces = inference_video(args, DET)
+        timings['scene'] = time.perf_counter() - t0
         
+        # ⏱️ 3. Face Detection (S3FD)
+        t0 = time.perf_counter()
+        faces = inference_video(args, DET)
+        timings['facedet'] = time.perf_counter() - t0
+        
+        # ⏱️ 4-1. Face Tracking
+        t0 = time.perf_counter()
         allTracks = []
         for shot in scene:
             if shot[1].frame_num - shot[0].frame_num >= args.minTrack: 
                 allTracks.extend(track_shot(args, faces[shot[0].frame_num:shot[1].frame_num]))
+        timings['tracking'] = time.perf_counter() - t0
                 
-        if len(allTracks) == 0: return [], None, None
+        if len(allTracks) == 0: return [], None, None, timings
             
         valid_tracks = [t for t in allTracks if len(t['frame']) >= 25]
         valid_tracks.sort(key=lambda x: len(x['frame']), reverse=True)
         top_tracks = valid_tracks[:2]
         
-        if len(top_tracks) == 0: return [], None, None
+        if len(top_tracks) == 0: return [], None, None, timings
 
         _, full_audio = wavfile.read(args.audioFilePath)
         total_frames = int((len(full_audio) / 16000.0) * 25)
@@ -396,11 +409,20 @@ def process_single_video(video_path, output_dir, DET, ASD_model):
         valid_tracks_info = {}
         valid_tids = []
         
+        timings['crop'] = 0.0
+        timings['asd_infer'] = 0.0
+        
         # 3. ASD 스코어 추출
         for track_id, track in enumerate(top_tracks):
+            # ⏱️ 4-2. Video Cropping
+            t0 = time.perf_counter()
             crop_file_path = os.path.join(args.pycropPath, f'track_{track_id}')
             crop_video(args, track, crop_file_path)
-            scores = evaluate_network_single(crop_file_path + '.avi', ASD_model)
+            timings['crop'] += (time.perf_counter() - t0)
+            
+            # ⏱️ 5. Pure ASD Inference
+            scores, pure_time = evaluate_network_single(crop_file_path + '.avi', ASD_model)
+            timings['asd_infer'] += pure_time
             
             global_scores = np.full(total_frames, -10.0, dtype=np.float32)
             frames_list = track['frame'].tolist() if isinstance(track['frame'], np.ndarray) else track['frame']
@@ -425,7 +447,7 @@ def process_single_video(video_path, output_dir, DET, ASD_model):
         final_audio_path = f"{output_npy_base}_16k.wav"
         subprocess.call(f"cp {args.audioFilePath} {final_audio_path}", shell=True)
 
-        return valid_tids, meta_pkl_path, final_audio_path
+        return valid_tids, meta_pkl_path, final_audio_path, timings
         
     finally:
         rmtree(args.savePath, ignore_errors=True)
@@ -566,10 +588,10 @@ def main():
             print("▶️ [Stage 1] Extracting ASD Scores...")
             t_asd_start = time.perf_counter()
             
-            valid_tracks, meta_path, audio_path = process_single_video(video_path, args.output_dir, DET, ASD_model)
+            # 🚀 반환값 업데이트
+            valid_tracks, meta_path, audio_path, timings = process_single_video(video_path, args.output_dir, DET, ASD_model)
             
-            t_asd_end = time.perf_counter()
-            asd_time_total = t_asd_end - t_asd_start
+            asd_total_time = time.perf_counter() - t_asd_start
 
             if not valid_tracks:
                 print(f"⚠️ No valid tracks found for {basename}. Skipping.")
@@ -658,17 +680,24 @@ def main():
             final_audio = out_buffer / window_sum
             
             # ---------------------------------------------------------
-            # 📊 Profiling Report Print
+            # 📊 Detailed Profiling Report Print
             # ---------------------------------------------------------
             print(f"\n📊 [Profiler Report] Performance Breakdown for '{basename}'")
             print(f"  - Total Audio Duration : {total_samples / sr:.2f} seconds")
             print(f"  - Total Chunks         : {num_chunks} chunks")
+            print(f"  =======================================================")
+            print(f"  ⏱️ 1. ASD Pipeline Total : {asd_total_time:.3f} s")
+            print(f"       ├─ Media Extract (FFmpeg) : {timings.get('media', 0):.3f} s (모바일 HW 코덱 대체 가능)")
+            print(f"       ├─ Scene Detection        : {timings.get('scene', 0):.3f} s")
+            print(f"       ├─ Face Detect (S3FD)     : {timings.get('facedet', 0):.3f} s (모바일 NPU/ISP 연동 가능)")
+            print(f"       ├─ Track & Crop           : {timings.get('tracking', 0) + timings.get('crop', 0):.3f} s")
+            print(f"       └─ Pure ASD Inference     : {timings.get('asd_infer', 0):.3f} s 🔥 (핵심 병목 구간 확인)")
             print(f"  -------------------------------------------------------")
-            print(f"  ⏱️ 1. ASD Extraction : {asd_time_total:.3f} s")
-            print(f"  ⏱️ 2. TIGER Inference: {sep_time_total:.3f} s (Avg {(sep_time_total/num_chunks)*1000:.1f} ms / chunk)")
-            print(f"  ⏱️ 3. CSS Matching   : {match_time_total:.3f} s (Avg {(match_time_total/num_chunks)*1000:.1f} ms / chunk)")
-            print(f"  -------------------------------------------------------")
-            print(f"  ⚡ Total Backend Time : {asd_time_total + sep_time_total + match_time_total:.3f} s")
+            print(f"  ⏱️ 2. TIGER Inference      : {sep_time_total:.3f} s (Avg {(sep_time_total/num_chunks)*1000:.1f} ms / chunk)")
+            print(f"  ⏱️ 3. CSS Matching         : {match_time_total:.3f} s (Avg {(match_time_total/num_chunks)*1000:.1f} ms / chunk)")
+            print(f"  =======================================================")
+            core_time = timings.get('asd_infer', 0) + sep_time_total + match_time_total
+            print(f"  ⚡ Core On-device Time     : {core_time:.3f} s (순수 AI 모델 연산 합산)")
 
             # ---------------------------------------------------------
             # [Stage 4] Visualization (Not included in profile time)
