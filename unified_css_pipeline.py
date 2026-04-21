@@ -135,6 +135,8 @@ class AdvancedHybridMatcher:
         self.golden_buffer = RobustGoldenFeatureBuffer(sr=sr)
         self.active_rms_thresh = 0.005
 
+        self.rejection_thresh = 0.15
+
     def _calc_rms(self, wav):
         return torch.sqrt(torch.mean(wav**2, dim=-1) + 1e-9)
 
