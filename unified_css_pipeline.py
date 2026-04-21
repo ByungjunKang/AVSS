@@ -1,5 +1,12 @@
 import os
 import sys
+
+# 🚀 [경로 병합] LR-ASD 모델 폴더의 절대 경로를 파이썬 시스템 경로에 강제로 추가합니다.
+# 주의: 아래 경로를 실제 PC의 LR-ASD 폴더 절대 경로로 반드시 변경해 주세요!
+LR_ASD_DIR = "/home/user/workspace/LR-ASD-folder" 
+if not os.path.exists(LR_ASD_DIR):
+    raise FileNotFoundError(f"LR-ASD 폴더를 찾을 수 없습니다: {LR_ASD_DIR}")
+sys.path.append(LR_ASD_DIR)
 import glob
 import time
 import argparse
