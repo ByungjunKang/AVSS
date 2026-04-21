@@ -10,27 +10,77 @@ import torch.nn.functional as F
 import torchaudio
 import torchaudio.transforms as T
 from scipy.optimize import linear_sum_assignment
+from speechbrain.pretrained import EncoderClassifier
 
-# -------------------------------------------------------------------------
-# 1. Golden Buffer & Hybrid Matcher (로깅 기능 추가)
-# -------------------------------------------------------------------------
-class GoldenFeatureBuffer:
-    def __init__(self, sr=16000, n_mfcc=20, ema_alpha=0.8):
-        self.mfcc_transform = T.MFCC(sample_rate=sr, n_mfcc=n_mfcc)
-        self.golden_profiles = {}
+class RobustGoldenFeatureBuffer:
+    def __init__(self, sr=16000, ema_alpha=0.8, device="cuda"):
+        self.sr = sr
         self.ema_alpha = ema_alpha
+        self.device = device
+        
+        # 오프라인 강제 로드 설정
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        local_dir = os.path.join(base_dir, "pretrained_ecapa")
+        
+        print(f"⏳ Loading ECAPA-TDNN locally from: {local_dir}")
+        self.encoder = EncoderClassifier.from_hparams(source=local_dir, savedir=local_dir, run_opts={"device": device})
+        self.encoder.eval()
+        
+        self.golden_profiles = {}
+        self.candidate_queues = {}
+        self.queue_max_size = 3
+        self.consistency_thresh = 0.8
+
+    # (RobustGoldenFeatureBuffer 클래스 내부에 추가)
+    def has_profile(self, track_id):
+        """해당 화자의 Golden Profile이 버퍼에 존재하는지 확인"""
+        return track_id in self.golden_profiles
 
     def _get_vocal_profile(self, wav_tensor):
-        mfcc = self.mfcc_transform(wav_tensor)
-        return mfcc.mean(dim=-1)
+        if wav_tensor.dim() == 1:
+            wav_tensor = wav_tensor.unsqueeze(0)
+        with torch.no_grad():
+            embeddings = self.encoder.encode_batch(wav_tensor)
+            return embeddings.squeeze()
 
-    def update(self, track_id, wav_tensor):
+    def update(self, track_id, wav_tensor, is_strict_vis=False, is_high_conf_vis=False):
         new_profile = self._get_vocal_profile(wav_tensor)
+        
+        # 🚀 [Fix #4] Bootstrap 로직: 버퍼가 비어있을 때는 is_high_conf_vis(0.85)만 넘어도 최초 1회 즉시 허용
+        is_empty = track_id not in self.golden_profiles
+        if is_strict_vis or (is_empty and is_high_conf_vis):
+            self._apply_ema_update(track_id, new_profile)
+            self.candidate_queues[track_id] = [] # 큐 초기화
+            return
+
+        # Slow Track (Queue 대기)
+        if track_id not in self.candidate_queues:
+            self.candidate_queues[track_id] = []
+            
+        self.candidate_queues[track_id].append(new_profile)
+        
+        if len(self.candidate_queues[track_id]) >= self.queue_max_size:
+            q = self.candidate_queues[track_id]
+            sim_01 = F.cosine_similarity(q[0].unsqueeze(0), q[1].unsqueeze(0)).item()
+            sim_12 = F.cosine_similarity(q[1].unsqueeze(0), q[2].unsqueeze(0)).item()
+            sim_02 = F.cosine_similarity(q[0].unsqueeze(0), q[2].unsqueeze(0)).item()
+            
+            if min(sim_01, sim_12, sim_02) > self.consistency_thresh:
+                mean_profile = F.normalize(torch.stack(q).mean(dim=0), dim=0)
+                self._apply_ema_update(track_id, mean_profile)
+                
+            self.candidate_queues[track_id].pop(0)
+
+    def _apply_ema_update(self, track_id, new_profile):
         if track_id not in self.golden_profiles:
             self.golden_profiles[track_id] = new_profile
         else:
-            self.golden_profiles[track_id] = (self.ema_alpha * self.golden_profiles[track_id]) + \
-                                             ((1 - self.ema_alpha) * new_profile)
+            updated = (self.ema_alpha * self.golden_profiles[track_id]) + ((1 - self.ema_alpha) * new_profile)
+            self.golden_profiles[track_id] = F.normalize(updated, dim=0)
 
     def get_similarity(self, track_id, wav_tensor):
         if track_id not in self.golden_profiles:
@@ -41,14 +91,12 @@ class GoldenFeatureBuffer:
         return max(0.0, F.cosine_similarity(prof_a, prof_b).item())
 
 class AdvancedHybridMatcher:
-    def __init__(self, sr=16000, overlap_sec=1.5, video_fps=25):
+    def __init__(self, sr=16000, video_fps=25):
         self.sr = sr
         self.video_fps = video_fps
-        self.overlap_samples = int(overlap_sec * sr)
-        self.golden_buffer = GoldenFeatureBuffer(sr=sr)
-        self.history = {}
-        self.golden_vis_thresh = 0.9  
-        self.active_rms_thresh = 0.005 # 침묵 기준 약간 완화
+        self.golden_buffer = RobustGoldenFeatureBuffer(sr=sr)
+        self.active_rms_thresh = 0.005
+        # 🚀 Lazy Init, Rejection 관련 변수 모두 제거됨
 
     def _calc_rms(self, wav):
         return torch.sqrt(torch.mean(wav**2, dim=-1) + 1e-9)
@@ -57,21 +105,12 @@ class AdvancedHybridMatcher:
         frame_len = self.sr // self.video_fps
         T_video = asd_probs.shape[0]
         req_samples = T_video * frame_len
-        
-        if wav.shape[0] < req_samples:
-            wav_padded = F.pad(wav, (0, req_samples - wav.shape[0]))
-        else:
-            wav_padded = wav[:req_samples]
-            
+        wav_padded = F.pad(wav, (0, max(0, req_samples - wav.shape[0])))[:req_samples]
         wav_frames = wav_padded.view(T_video, frame_len)
         audio_env = self._calc_rms(wav_frames)
-        
         a_env = audio_env - audio_env.mean()
         v_env = asd_probs - asd_probs.mean()
-        
-        a_norm = torch.norm(a_env) + 1e-8
-        v_norm = torch.norm(v_env) + 1e-8
-        corr = torch.sum(a_env * v_env) / (a_norm * v_norm)
+        corr = torch.sum(a_env * v_env) / (torch.norm(a_env) * torch.norm(v_env) + 1e-8)
         return corr.item()
 
     def match(self, est_sources, asd_scores, chunk_idx):
@@ -79,8 +118,7 @@ class AdvancedHybridMatcher:
         T_chunk = est_sources.shape[-1]
         
         S_total = torch.zeros(K, N)
-        S_short_matrix = torch.zeros(K, N) # 🚀 [버그 픽스] 단기 유사도를 저장할 전용 행렬
-        Log_matrix = [["" for _ in range(N)] for _ in range(K)] 
+        Log_matrix = [["" for _ in range(N)] for _ in range(K)]
         
         asd_probs = torch.sigmoid(asd_scores)
         max_vis_scores, _ = torch.max(asd_probs, dim=-1)
@@ -88,62 +126,55 @@ class AdvancedHybridMatcher:
         for n in range(N):
             vis_prob = max_vis_scores[n].item()
             is_vis_present = vis_prob > 0.01 
+            has_profile = self.golden_buffer.has_profile(n)
             
+            # 🚀 Lazy Init 조건문 제거됨
+
             for k in range(K):
                 wav_k = est_sources[k]
                 
-                # 1. 시각 유사도 (음수 방어 로직 통일)
-                score_vis = 0.0
-                if is_vis_present:
-                    score_vis = max(0.0, self._calc_av_correlation(wav_k, asd_probs[n])) * vis_prob
-                
-                # 2. 단기 오디오 유사도
-                score_aud_short = 0.0
-                if chunk_idx > 0 and n in self.history and self.history[n]['is_active']:
-                    prev_tail = self.history[n]['overlap_wav']
-                    curr_head = wav_k[:self.overlap_samples]
-                    # 음수 방어 및 코사인 유사도
-                    score_aud_short = max(0.0, F.cosine_similarity(prev_tail.unsqueeze(0), curr_head.unsqueeze(0)).item())
-                
-                S_short_matrix[k, n] = score_aud_short # 🚀 연산된 점수를 자기 자리에 정확히 저장!
-                
-                # 3. 장기 오디오 유사도
+                score_vis = max(0.0, self._calc_av_correlation(wav_k, asd_probs[n])) * vis_prob if is_vis_present else 0.0
                 score_aud_long = self.golden_buffer.get_similarity(n, wav_k)
                 
-                # 라우팅
-                if is_vis_present and vis_prob > 0.8:
-                    S_total[k, n] = score_vis
-                    Log_matrix[k][n] = f"VIS ({score_vis:.2f})"
-                elif score_aud_short > 0.4:
-                    S_total[k, n] = score_aud_short
-                    Log_matrix[k][n] = f"SHORT({score_aud_short:.2f}) | L({score_aud_long:.2f})"
+                # 라우팅 전략 (FUSED / VIS / LONG)
+                if vis_prob > 0.8:
+                    if has_profile:
+                        fused_score = (score_vis + score_aud_long) / 2.0
+                        S_total[k, n] = fused_score
+                        Log_matrix[k][n] = f"FUSED({fused_score:.2f}) [V:{score_vis:.2f}|L:{score_aud_long:.2f}]"
+                    else:
+                        S_total[k, n] = score_vis
+                        Log_matrix[k][n] = f"VIS({score_vis:.2f})"
                 else:
                     S_total[k, n] = score_aud_long
-                    Log_matrix[k][n] = f"LONG({score_aud_long:.2f}) | S({score_aud_short:.2f})"
-                    
-        # Hungarian Matching
+                    Log_matrix[k][n] = f"LONG({score_aud_long:.2f})"
+
+            # 🚀 패널티(-1.0) 부여 로직 제거됨
+        
         row_ind, col_ind = linear_sum_assignment(-S_total.numpy())
+        
         aligned_sources = torch.zeros((N, T_chunk), dtype=est_sources.dtype, device=est_sources.device)
-        chunk_decisions = {} 
+        chunk_decisions = {}
         
         for r, c in zip(row_ind, col_ind):
+            matched_score = S_total[r, c].item()
+            routing_reason = Log_matrix[r][c]
+            
+            # 🚀 Silent Padding 처리 전면 제거됨 (헝가리안 매칭 결과를 100% 수용)
+
             aligned_wav = est_sources[r]
             aligned_sources[c] = aligned_wav
-            chunk_decisions[c] = Log_matrix[r][c] 
+            chunk_decisions[c] = routing_reason
             
-            # 🚀 [버그 픽스] 정확히 (r, c) 매칭에 해당하는 단기 점수를 꺼내어 검사!
-            matched_short_score = S_short_matrix[r, c].item()
-            is_high_conf_vis = max_vis_scores[c] > 0.85
-            is_high_conf_aud = chunk_idx > 0 and c in self.history and matched_short_score > 0.9
+            vis_prob_for_c = max_vis_scores[c].item()
+            is_strict_vis = vis_prob_for_c > 0.95
+            is_high_conf_vis = vis_prob_for_c > 0.85
             
-            if (is_high_conf_vis or is_high_conf_aud) and self._calc_rms(aligned_wav) > self.active_rms_thresh:
-                self.golden_buffer.update(c, aligned_wav)
-                
-            tail_wav = aligned_wav[-self.overlap_samples:]
-            self.history[c] = {
-                "overlap_wav": tail_wav,
-                "is_active": self._calc_rms(tail_wav) > self.active_rms_thresh
-            }
+            # 버퍼 업데이트: 확실한 비전이거나 확실한 롱(ECAPA) 점수일 때만 갱신하여 오염 방지
+            is_high_conf_long = routing_reason.startswith("LONG") and matched_score > 0.85
+            
+            if (is_high_conf_vis or is_high_conf_long) and self._calc_rms(aligned_wav) > self.active_rms_thresh:
+                self.golden_buffer.update(c, aligned_wav, is_strict_vis=is_strict_vis, is_high_conf_vis=is_high_conf_vis)
             
         return aligned_sources, chunk_decisions
 
@@ -251,14 +282,15 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     
     import look2hear.models
-    model = look2hear.models.TIGER(out_channels=128, in_channels=256, num_blocks=8, num_sources=3)
+    model = look2hear.models.TIGER(out_channels=132, in_channels=256, num_blocks=8, num_sources=3,
+                                  upsampling_depth=5, win=640, stride=160, sample_rate=16000)
     ckpt = torch.load(args.ckpt_path, map_location=device)
     state_dict = ckpt.get('state_dict', ckpt)
     model.load_state_dict({k.replace('audio_model.', ''): v for k, v in state_dict.items()}, strict=False)
     model.to(device).eval()
 
     sr, fps = 16000, 25
-    chunk_sec, overlap_sec = 3.0, 1.5
+    chunk_sec, overlap_sec = 3.0, 1.0
     chunk_samples = int(chunk_sec * sr)
     stride_samples = int((chunk_sec - overlap_sec) * sr)
     chunk_frames = int(chunk_sec * fps)
@@ -275,7 +307,7 @@ def main():
             if not os.path.exists(audio_path) or not os.path.exists(meta_path):
                 continue
                 
-            top_tracks = [0, 1]
+            top_tracks = [0, 1, 2, 3]
             valid_tracks = []
             for tid in top_tracks:
                 if os.path.exists(os.path.join(args.asd_dir, f"{basename}_track{tid}.npy")):
