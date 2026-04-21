@@ -294,6 +294,11 @@ def crop_video(args, track, cropFile):
     return {'track':track, 'proc_track':dets}
 
 def evaluate_network_single(file, ASD_model):
+    from scipy.io import wavfile
+    import python_speech_features
+    import time # 시간 측정용 추가
+    import numpy as np
+
     _, audio = wavfile.read(file.replace('.avi', '.wav'))
     audioFeature = python_speech_features.mfcc(audio, 16000, numcep=13, winlen=0.025, winstep=0.010)
     
@@ -318,6 +323,8 @@ def evaluate_network_single(file, ASD_model):
     durationSet = {1,1,1,2,2,2,3,3,4,5,6} 
     allScore = [] 
     
+    pure_inference_time = 0.0 # 🚀 순수 모델 추론 시간 누적 변수
+
     for duration in durationSet:
         batchSize = int(math.ceil(length / duration))
         scores = []
@@ -325,15 +332,27 @@ def evaluate_network_single(file, ASD_model):
             for i in range(batchSize):
                 inputA = torch.FloatTensor(audioFeature[i * duration * 100:(i+1) * duration * 100,:]).unsqueeze(0).cuda()
                 inputV = torch.FloatTensor(videoFeature[i * duration * 25: (i+1) * duration * 25,:,:]).unsqueeze(0).cuda()
+                
+                # 🚀 GPU 연산 대기 및 타이머 시작
+                if torch.cuda.is_available(): torch.cuda.synchronize()
+                t_start = time.perf_counter()
+                
                 embedA = ASD_model.model.forward_audio_frontend(inputA)
                 embedV = ASD_model.model.forward_visual_frontend(inputV)    
                 out = ASD_model.model.forward_audio_visual_backend(embedA, embedV)
                 score = ASD_model.lossAV.forward(out, labels = None)
+                
+                # 🚀 GPU 연산 종료 및 시간 합산
+                if torch.cuda.is_available(): torch.cuda.synchronize()
+                pure_inference_time += (time.perf_counter() - t_start)
+                
                 scores.extend(score)
         allScore.append(scores)
         
     allScore = np.round((np.mean(np.array(allScore), axis = 0)), 1).astype(float)
-    return allScore
+    
+    # 🚀 점수 배열과 함께 순수 추론 시간도 반환
+    return allScore, pure_inference_time
 
 class ProcessArgs:
     pass
