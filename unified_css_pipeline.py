@@ -671,8 +671,12 @@ def main():
             matcher = AdvancedHybridMatcher(sr=sr, video_fps=fps)
             track_logs = {tid: [] for tid in valid_tracks}
 
-            num_chunks = (total_samples - chunk_samples) // stride_samples + 1
-            if total_samples < chunk_samples: num_chunks = 1
+            # 🚀 [Fix 1] math.ceil을 사용하여 남은 꼬리 구간을 처리할 추가 청크 확보
+            import math
+            if total_samples <= chunk_samples:
+                num_chunks = 1
+            else:
+                num_chunks = math.ceil((total_samples - chunk_samples) / stride_samples) + 1
             
             sep_time_total = 0.0
             match_time_total = 0.0
@@ -719,8 +723,15 @@ def main():
                 match_time_total += (time.perf_counter() - t_match_start)
                 
                 weighted_chunk = aligned_chunk * window.unsqueeze(0)
-                out_buffer[:, start_samp:end_samp] += weighted_chunk
-                window_sum[:, start_samp:end_samp] += window
+                
+                # 🚀 [Fix 2] 마지막 청크가 total_samples를 넘어갈 경우, 패딩된 꼬리를 잘라내고 삽입
+                if end_samp > total_samples:
+                    valid_len = total_samples - start_samp
+                    out_buffer[:, start_samp:total_samples] += weighted_chunk[:, :valid_len]
+                    window_sum[:, start_samp:total_samples] += window[:valid_len]
+                else:
+                    out_buffer[:, start_samp:end_samp] += weighted_chunk
+                    window_sum[:, start_samp:end_samp] += window
                 
                 chunk_start_sec = start_samp / sr
                 for i, tid in enumerate(valid_tracks):
