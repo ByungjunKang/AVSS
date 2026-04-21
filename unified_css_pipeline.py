@@ -154,8 +154,6 @@ class AdvancedHybridMatcher:
         K, N = est_sources.shape[0], asd_scores.shape[0]
         T_chunk = est_sources.shape[-1]
         
-        # 🚀 [Optimization] 매칭 시작 전, K개 채널에 대한 임베딩을 '딱 한 번씩만' 추출
-        # 이 과정이 실제 NPU가 부담해야 할 순수 추론 횟수(K회)가 됩니다.
         channel_embeddings = []
         for k in range(K):
             channel_embeddings.append(self.golden_buffer._get_vocal_profile(est_sources[k]))
@@ -168,14 +166,26 @@ class AdvancedHybridMatcher:
         
         for n in range(N):
             vis_prob = max_vis_scores[n].item()
+            
+            # 패딩(-10)을 거친 sigmoid 값은 0.00004 수준. 
+            # 0.01 이상이면 화면 안에 이 사람의 얼굴이 정상적으로 트래킹되고 있다는 뜻
+            is_face_tracked = vis_prob > 0.01 
             has_profile = self.golden_buffer.has_profile(n)
 
             for k in range(K):
-                # 미리 뽑아둔 임베딩 재사용 (중복 연산 제거)
+                wav_k = est_sources[k]
                 current_embed = channel_embeddings[k]
-                score_vis = max(0.0, self._calc_av_correlation(est_sources[k], asd_probs[n])) * vis_prob
+                
+                # 🚀 [Fix 1] AV Correlation 불안정성 보완: Base Score(0.5) 보장
+                if is_face_tracked:
+                    corr = self._calc_av_correlation(wav_k, asd_probs[n])
+                    score_vis = vis_prob * (0.5 + 0.5 * max(0.0, corr))
+                else:
+                    score_vis = 0.0
+                    
                 score_aud_long = self.golden_buffer.get_similarity_with_embed(n, current_embed)
-        
+                
+                # 라우팅 전략
                 if vis_prob > 0.8:
                     if has_profile:
                         fused_score = (score_vis + score_aud_long) / 2.0
@@ -185,9 +195,18 @@ class AdvancedHybridMatcher:
                         S_total[k, n] = score_vis
                         Log_matrix[k][n] = f"VIS({score_vis:.2f})"
                 else:
-                    S_total[k, n] = score_aud_long
-                    Log_matrix[k][n] = f"LONG({score_aud_long:.2f})"
+                    # 🚀 [Fix 2] Cross-Modal Veto Penalty
+                    # 화면 안에 얼굴이 명확히 있는데(is_face_tracked) 입을 닫고 있다면(vis_prob < 0.3)
+                    # 오프스크린 동성 화자의 목소리가 침범하지 못하도록 LONG 점수를 90% 깎아버립니다.
+                    if is_face_tracked and vis_prob < 0.3:
+                        penalized_long = score_aud_long * 0.1
+                        S_total[k, n] = penalized_long
+                        Log_matrix[k][n] = f"PENALTY_L({penalized_long:.2f} <- {score_aud_long:.2f})"
+                    else:
+                        S_total[k, n] = score_aud_long
+                        Log_matrix[k][n] = f"LONG({score_aud_long:.2f})"
         
+        # 헝가리안 매칭 실행
         row_ind, col_ind = linear_sum_assignment(-S_total.numpy())
         
         aligned_sources = torch.zeros((N, T_chunk), dtype=est_sources.dtype, device=est_sources.device)
@@ -197,26 +216,23 @@ class AdvancedHybridMatcher:
             matched_score = S_total[r, c].item()
             routing_reason = Log_matrix[r][c]
             
-            # 1. 🚀 최종 채널 할당 및 로깅 (삭제되면 안 되는 필수 로직)
+            # Rejection Threshold (0.15) - 페널티 받은 LONG 점수는 여기서 SILENT 처리됨
+            if matched_score < self.rejection_thresh:
+                aligned_sources[c] = torch.zeros_like(est_sources[r])
+                chunk_decisions[c] = f"REJECTED({matched_score:.2f}) -> SILENT"
+                continue
+                
             aligned_wav = est_sources[r]
             aligned_sources[c] = aligned_wav
             chunk_decisions[c] = routing_reason
             
-            # 2. 🚀 업데이트 자격 심사 (조건문 유지)
             vis_prob_for_c = max_vis_scores[c].item()
             is_strict_vis = vis_prob_for_c > 0.95
             is_high_conf_vis = vis_prob_for_c > 0.85
             is_high_conf_long = routing_reason.startswith("LONG") and matched_score > 0.85
             
-            # 3. 🚀 최적화된 버퍼 업데이트 (Pre-extracted 임베딩 재사용)
             if (is_high_conf_vis or is_high_conf_long) and self._calc_rms(aligned_wav) > self.active_rms_thresh:
-                # aligned_wav를 다시 인코딩하지 않고, 매칭 전 뽑아둔 'channel_embeddings[r]'을 바로 삽입!
-                self.golden_buffer.update_with_embed(
-                    track_id=c, 
-                    new_profile=channel_embeddings[r], 
-                    is_strict_vis=is_strict_vis, 
-                    is_high_conf_vis=is_high_conf_vis
-                )
+                self.golden_buffer.update_with_embed(c, channel_embeddings[r], is_strict_vis=is_strict_vis, is_high_conf_vis=is_high_conf_vis)
             
         return aligned_sources, chunk_decisions
 
