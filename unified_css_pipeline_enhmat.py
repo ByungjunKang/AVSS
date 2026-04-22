@@ -128,14 +128,20 @@ class RobustGoldenFeatureBuffer:
             self.candidate_queues[track_id] = []
             return
 
+import math
+import torch
+import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment
+
 class AdvancedHybridMatcher:
     def __init__(self, sr=16000, video_fps=25):
         self.sr = sr
         self.video_fps = video_fps
         self.golden_buffer = RobustGoldenFeatureBuffer(sr=sr)
         self.active_rms_thresh = 0.005
-
-        self.rejection_thresh = 0.15
+        
+        # 🚀 [요구사항 3] Lazy Init 복구 (첫 비전 트리거 전까지 SILENT)
+        self.is_initialized = {}
 
     def _calc_rms(self, wav):
         return torch.sqrt(torch.mean(wav**2, dim=-1) + 1e-9)
@@ -156,6 +162,7 @@ class AdvancedHybridMatcher:
         K, N = est_sources.shape[0], asd_scores.shape[0]
         T_chunk = est_sources.shape[-1]
         
+        # 임베딩 중복 1회 추출 최적화 유지
         channel_embeddings = []
         for k in range(K):
             channel_embeddings.append(self.golden_buffer._get_vocal_profile(est_sources[k]))
@@ -168,17 +175,20 @@ class AdvancedHybridMatcher:
         
         for n in range(N):
             vis_prob = max_vis_scores[n].item()
-            
-            # 패딩(-10)을 거친 sigmoid 값은 0.00004 수준. 
-            # 0.01 이상이면 화면 안에 이 사람의 얼굴이 정상적으로 트래킹되고 있다는 뜻
             is_face_tracked = vis_prob > 0.01 
             has_profile = self.golden_buffer.has_profile(n)
+
+            # 🚀 Lazy Init Trigger: 확실한 비전이 잡히면 활성화
+            if not self.is_initialized.get(n, False):
+                if vis_prob >= 0.8:
+                    self.is_initialized[n] = True
 
             for k in range(K):
                 wav_k = est_sources[k]
                 current_embed = channel_embeddings[k]
+                rms_k = self._calc_rms(wav_k).mean().item() # 채널의 에너지 측정
                 
-                # 🚀 [Fix 1] AV Correlation 불안정성 보완: Base Score(0.5) 보장
+                # Base Score (0.5) 보장
                 if is_face_tracked:
                     corr = self._calc_av_correlation(wav_k, asd_probs[n])
                     score_vis = vis_prob * (0.5 + 0.5 * max(0.0, corr))
@@ -187,28 +197,38 @@ class AdvancedHybridMatcher:
                     
                 score_aud_long = self.golden_buffer.get_similarity_with_embed(n, current_embed)
                 
-                # 라우팅 전략
                 if vis_prob > 0.8:
                     if has_profile:
-                        fused_score = (score_vis + score_aud_long) / 2.0
-                        S_total[k, n] = fused_score
-                        Log_matrix[k][n] = f"FUSED({fused_score:.2f}) [V:{score_vis:.2f}|L:{score_aud_long:.2f}]"
+                        # 🚀 [요구사항 1] FUSED Veto 로직 (오프스크린 침범 차단)
+                        # 프로필을 아는데 L 점수가 너무 낮다면(0.3 미만), 비전이 높아도 강제 하향!
+                        if score_aud_long < 0.3:
+                            fused_score = score_aud_long # 산술평균 무시, L점수로 확 끌어내림
+                            S_total[k, n] = fused_score
+                            Log_matrix[k][n] = f"FUSED_VETO({fused_score:.2f}) [V:{score_vis:.2f}|L:{score_aud_long:.2f}]"
+                        else:
+                            fused_score = (score_vis + score_aud_long) / 2.0
+                            S_total[k, n] = fused_score
+                            Log_matrix[k][n] = f"FUSED({fused_score:.2f}) [V:{score_vis:.2f}|L:{score_aud_long:.2f}]"
                     else:
                         S_total[k, n] = score_vis
                         Log_matrix[k][n] = f"VIS({score_vis:.2f})"
                 else:
-                    # 🚀 [Fix 2] Cross-Modal Veto Penalty
-                    # 화면 안에 얼굴이 명확히 있는데(is_face_tracked) 입을 닫고 있다면(vis_prob < 0.3)
-                    # 오프스크린 동성 화자의 목소리가 침범하지 못하도록 LONG 점수를 90% 깎아버립니다.
-                    if is_face_tracked and vis_prob < 0.3:
-                        penalized_long = score_aud_long * 0.1
-                        S_total[k, n] = penalized_long
-                        Log_matrix[k][n] = f"PENALTY_L({penalized_long:.2f} <- {score_aud_long:.2f})"
+                    # 🚀 [요구사항 4] Energy-based Silent Match
+                    # 화면에 있고 입을 굳게 닫고 있을 때 (vis < 0.2)
+                    if is_face_tracked and vis_prob < 0.2:
+                        # 에너지가 낮을수록 1에 가까운 점수, 높을수록 0에 가까운 점수 산출
+                        score_silent = math.exp(-rms_k * 50) 
+                        S_total[k, n] = score_silent
+                        Log_matrix[k][n] = f"SILENT_E({score_silent:.2f}|rms:{rms_k:.3f})"
                     else:
                         S_total[k, n] = score_aud_long
                         Log_matrix[k][n] = f"LONG({score_aud_long:.2f})"
+
+            # 🚀 Lazy Init 패널티: 활성화 안 된 화자는 점수판에서 강제 격리
+            if not self.is_initialized.get(n, False):
+                S_total[:, n] = -1.0
         
-        # 헝가리안 매칭 실행
+        # 헝가리안 매칭 실행 (기존 유지)
         row_ind, col_ind = linear_sum_assignment(-S_total.numpy())
         
         aligned_sources = torch.zeros((N, T_chunk), dtype=est_sources.dtype, device=est_sources.device)
@@ -218,10 +238,10 @@ class AdvancedHybridMatcher:
             matched_score = S_total[r, c].item()
             routing_reason = Log_matrix[r][c]
             
-            # Rejection Threshold (0.15) - 페널티 받은 LONG 점수는 여기서 SILENT 처리됨
-            if matched_score < self.rejection_thresh:
+            # 🚀 Lazy Init SILENT 처리 (초기 활성화 전까지는 무음)
+            if not self.is_initialized.get(c, False):
                 aligned_sources[c] = torch.zeros_like(est_sources[r])
-                chunk_decisions[c] = f"REJECTED({matched_score:.2f}) -> SILENT"
+                chunk_decisions[c] = "SILENT (Waiting)"
                 continue
                 
             aligned_wav = est_sources[r]
