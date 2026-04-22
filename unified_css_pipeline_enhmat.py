@@ -129,9 +129,6 @@ class RobustGoldenFeatureBuffer:
             return
 
 import math
-import torch
-import torch.nn.functional as F
-from scipy.optimize import linear_sum_assignment
 
 class AdvancedHybridMatcher:
     def __init__(self, sr=16000, video_fps=25):
@@ -140,7 +137,7 @@ class AdvancedHybridMatcher:
         self.golden_buffer = RobustGoldenFeatureBuffer(sr=sr)
         self.active_rms_thresh = 0.005
         
-        # 🚀 [요구사항 3] Lazy Init 복구 (첫 비전 트리거 전까지 SILENT)
+        # 🚀 첫 발화 전까지 대기하는 Lazy Init 유지 (Rejection Thresh 제거)
         self.is_initialized = {}
 
     def _calc_rms(self, wav):
@@ -162,7 +159,7 @@ class AdvancedHybridMatcher:
         K, N = est_sources.shape[0], asd_scores.shape[0]
         T_chunk = est_sources.shape[-1]
         
-        # 임베딩 중복 1회 추출 최적화 유지
+        # 임베딩 최적화 유지
         channel_embeddings = []
         for k in range(K):
             channel_embeddings.append(self.golden_buffer._get_vocal_profile(est_sources[k]))
@@ -178,7 +175,7 @@ class AdvancedHybridMatcher:
             is_face_tracked = vis_prob > 0.01 
             has_profile = self.golden_buffer.has_profile(n)
 
-            # 🚀 Lazy Init Trigger: 확실한 비전이 잡히면 활성화
+            # Lazy Init 트리거
             if not self.is_initialized.get(n, False):
                 if vis_prob >= 0.8:
                     self.is_initialized[n] = True
@@ -186,9 +183,8 @@ class AdvancedHybridMatcher:
             for k in range(K):
                 wav_k = est_sources[k]
                 current_embed = channel_embeddings[k]
-                rms_k = self._calc_rms(wav_k).mean().item() # 채널의 에너지 측정
                 
-                # Base Score (0.5) 보장
+                # Base Score 유지 (0.5)
                 if is_face_tracked:
                     corr = self._calc_av_correlation(wav_k, asd_probs[n])
                     score_vis = vis_prob * (0.5 + 0.5 * max(0.0, corr))
@@ -199,10 +195,9 @@ class AdvancedHybridMatcher:
                 
                 if vis_prob > 0.8:
                     if has_profile:
-                        # 🚀 [요구사항 1] FUSED Veto 로직 (오프스크린 침범 차단)
-                        # 프로필을 아는데 L 점수가 너무 낮다면(0.3 미만), 비전이 높아도 강제 하향!
+                        # 🚀 [진단 1 유지] FUSED VETO
                         if score_aud_long < 0.3:
-                            fused_score = score_aud_long # 산술평균 무시, L점수로 확 끌어내림
+                            fused_score = score_aud_long
                             S_total[k, n] = fused_score
                             Log_matrix[k][n] = f"FUSED_VETO({fused_score:.2f}) [V:{score_vis:.2f}|L:{score_aud_long:.2f}]"
                         else:
@@ -213,23 +208,40 @@ class AdvancedHybridMatcher:
                         S_total[k, n] = score_vis
                         Log_matrix[k][n] = f"VIS({score_vis:.2f})"
                 else:
-                    # 🚀 [요구사항 4] Energy-based Silent Match
-                    # 화면에 있고 입을 굳게 닫고 있을 때 (vis < 0.2)
-                    if is_face_tracked and vis_prob < 0.2:
-                        # 에너지가 낮을수록 1에 가까운 점수, 높을수록 0에 가까운 점수 산출
-                        score_silent = math.exp(-rms_k * 50) 
-                        S_total[k, n] = score_silent
-                        Log_matrix[k][n] = f"SILENT_E({score_silent:.2f}|rms:{rms_k:.3f})"
+                    # 🚀 [진단 2 롤백] 에너지 기반 로직 제거 후 침묵 페널티(Fix 2) 원상 복구
+                    if is_face_tracked and vis_prob < 0.3:
+                        penalized_long = score_aud_long * 0.1
+                        S_total[k, n] = penalized_long
+                        Log_matrix[k][n] = f"PENALTY_L({penalized_long:.2f} <- {score_aud_long:.2f})"
                     else:
                         S_total[k, n] = score_aud_long
                         Log_matrix[k][n] = f"LONG({score_aud_long:.2f})"
 
-            # 🚀 Lazy Init 패널티: 활성화 안 된 화자는 점수판에서 강제 격리
+            # Lazy Init 격리 패널티
             if not self.is_initialized.get(n, False):
                 S_total[:, n] = -1.0
         
-        # 헝가리안 매칭 실행 (기존 유지)
-        row_ind, col_ind = linear_sum_assignment(-S_total.numpy())
+        # 🚀 비전 우선 할당 (Greedy Assignment) 로직 유지
+        active_faces = [n for n in range(N) if max_vis_scores[n].item() > 0.8]
+        row_ind, col_ind = [], []
+        
+        if len(active_faces) == 1:
+            n_target = active_faces[0]
+            best_k = torch.argmax(S_total[:, n_target]).item()
+            row_ind.append(best_k)
+            col_ind.append(n_target)
+            
+            rem_k = [k for k in range(K) if k != best_k]
+            rem_n = [n for n in range(N) if n != n_target]
+            
+            if rem_k and rem_n:
+                sub_S = S_total[rem_k][:, rem_n]
+                sub_r, sub_c = linear_sum_assignment(-sub_S.numpy())
+                for r, c in zip(sub_r, sub_c):
+                    row_ind.append(rem_k[r])
+                    col_ind.append(rem_n[c])
+        else:
+            row_ind, col_ind = linear_sum_assignment(-S_total.numpy())
         
         aligned_sources = torch.zeros((N, T_chunk), dtype=est_sources.dtype, device=est_sources.device)
         chunk_decisions = {}
@@ -238,7 +250,9 @@ class AdvancedHybridMatcher:
             matched_score = S_total[r, c].item()
             routing_reason = Log_matrix[r][c]
             
-            # 🚀 Lazy Init SILENT 처리 (초기 활성화 전까지는 무음)
+            # 🚀 강제 거절(Rejection Threshold) 로직 삭제됨 (헝가리안 결과를 그대로 100% 수용)
+            
+            # 단, Lazy Init 대기 중인 화자에 한해서만 SILENT 처리
             if not self.is_initialized.get(c, False):
                 aligned_sources[c] = torch.zeros_like(est_sources[r])
                 chunk_decisions[c] = "SILENT (Waiting)"
@@ -257,7 +271,6 @@ class AdvancedHybridMatcher:
                 self.golden_buffer.update_with_embed(c, channel_embeddings[r], is_strict_vis=is_strict_vis, is_high_conf_vis=is_high_conf_vis)
             
         return aligned_sources, chunk_decisions
-
 # =====================================================================
 # 2. ASD Extraction Functions
 # =====================================================================
